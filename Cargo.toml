@@ -1,0 +1,28 @@
+[package]
+name = "search"
+version = "0.1.0"
+edition = "2021"
+description = "A small, quiet web browser — a native Linux port of Search"
+license = "MIT"
+
+[dependencies]
+gtk = "0.18"
+gdk = "0.18"
+gdk-pixbuf = "0.18"
+glib = "0.18"
+gio = "0.18"
+cairo-rs = "0.18"
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
+javascriptcore-rs = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
