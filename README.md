@@ -1,6 +1,6 @@
 # Search (Linux)
 
-Native Linux port of the macOS **Search** browser from `/home/pedro/Search`,
+Native Linux port of the macOS **Search** browser,
 rebuilt in Rust on top of GTK 3.24 and WebKitGTK 4.1. The original macOS
 sources are left untouched; every piece that could not be recompiled was
 rewritten in Rust.
