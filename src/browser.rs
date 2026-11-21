@@ -1,0 +1,7073 @@
+// The window: tabs down the side or across the top, one field that takes an
+// address or a few words, and the pages Search draws for itself. The pieces
+// follow the Mac app — the sidebar, the floating field, the find bar, split
+// view, reading mode, hidden elements — with GTK where AppKit was.
+
+use std::cell::{Cell, RefCell};
+use std::ffi::CString;
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use gio::prelude::*;
+use glib::translate::*;
+use gtk::prelude::*;
+use javascriptcore::ValueExt;
+use webkit2gtk::*;
+use webkit2gtk::{
+    CacheModel, CookieAcceptPolicy, CookieManagerExt, CookiePersistentStorage, Download,
+    DownloadExt, FindControllerExt,
+    HitTestResultExt, LoadEvent, NavigationAction, NavigationPolicyDecision,
+    NavigationPolicyDecisionExt, NavigationType, PolicyDecision, PolicyDecisionExt, PolicyDecisionType,
+    SettingsExt, URISchemeRequestExt, URIResponseExt, UserContentInjectedFrames, UserContentManager,
+    UserContentManagerExt, UserScript, UserScriptInjectionTime, WebContext, WebContextExt, WebView,
+    WebViewExt, WebsiteDataManager, WebsiteDataManagerExtManual,
+};
+
+use crate::pages::{self, DownloadView, PageKind};
+use crate::store::{self, Bookmarks, Curtain, History, Prefs, SessionShape, SessionTab, Vault};
+use crate::util;
+
+// ------------------------------------------------------------------- script
+
+const PASSWORD_SCRIPT: &str = r#"
+(function () {
+  if (window.__searchPasswordHooked) return;
+  window.__searchPasswordHooked = true;
+  document.addEventListener('submit', function (event) {
+    try {
+      const form = event.target;
+      if (!form || !form.querySelector) return;
+      const password = form.querySelector('input[type="password"]');
+      if (!password || !password.value) return;
+      let user = '';
+      const inputs = form.querySelectorAll('input');
+      for (const input of inputs) {
+        const hint = (input.getAttribute('autocomplete') || '').toLowerCase();
+        if (input === password) continue;
+        if (hint.indexOf('username') >= 0) { user = input.value; break; }
+        if (!user && (input.type === 'email' || input.type === 'text')) user = input.value;
+      }
+      const message = {
+        action: 'password-capture',
+        host: location.hostname,
+        user: user,
+        password: password.value,
+      };
+      window.webkit.messageHandlers.search.postMessage(JSON.stringify(message));
+    } catch (error) {}
+  }, true);
+})();
+"#;
+
+const POINTER_SCRIPT: &str = r#"
+(function () {
+  // Only the top document reports: frames would send coordinates from
+  // their own little viewports, which look like the top-left corner.
+  if (window.top !== window) return;
+  if (window.__searchPointerHooked) return;
+  window.__searchPointerHooked = true;
+  var last = 0;
+  window.addEventListener('mousemove', function (event) {
+    var now = Date.now();
+    if (now - last < 60) return;
+    last = now;
+    try {
+      window.webkit.messageHandlers.search.postMessage(JSON.stringify({
+        action: 'ptr',
+        x: event.clientX,
+        y: event.clientY,
+      }));
+    } catch (error) {}
+  }, { passive: true });
+})();
+"#;
+
+const DARKEN_SCRIPT: &str = r#"
+(function () {
+  try {
+    if (document.getElementById('search-darken-style')) return;
+    const style = document.createElement('style');
+    style.id = 'search-darken-style';
+    style.textContent = "html{filter:invert(1) hue-rotate(180deg) !important;background:#fff !important}" +
+      "img,video,picture,canvas,svg,iframe,[style*='background-image']{filter:invert(1) hue-rotate(180deg) !important}";
+    (document.head || document.documentElement).appendChild(style);
+  } catch (error) {}
+})();
+"#;
+
+const YOUTUBE_SCRIPT: &str = r#"
+// YouTube's player configuration arrives inside JSON responses (the page's
+// own ytInitialPlayerResponse assignment, then /youtubei/v1/player fetches).
+// The WebKit content blocker can stop the ad requests it recognises, but the
+// ad instructions packed inside those player responses are not requests of
+// their own, so they have to be removed before the player reads them. This is
+// the job uBlock does with its json-prune / trusted-replace-xhr-response
+// scriptlets, which WebKit content blockers cannot express.
+(function () {
+  var host = (location.hostname || '').toLowerCase();
+  if (!/(^|\.)youtube\.com$/.test(host) &&
+      !/(^|\.)youtube-nocookie\.com$/.test(host)) {
+    return;
+  }
+  if (window.__searchYouTubeClean) return;
+  window.__searchYouTubeClean = true;
+
+  var AD_RENDERERS = {
+    adSlotRenderer: 1,
+    adLayoutRenderer: 1,
+    adRenderer: 1,
+    displayAdRenderer: 1,
+    promotedSparklesTextSearchRenderer: 1,
+    promotedSparklesWebRenderer: 1,
+    inFeedAdLayoutRenderer: 1,
+    videoMastheadAdV3Renderer: 1,
+    primetimeAdRenderer: 1,
+    adsEngagementPanelRenderer: 1
+  };
+
+  function hasAdRenderer(value) {
+    if (!value || typeof value !== 'object') return false;
+    for (var key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key) && AD_RENDERERS[key]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // YouTube also sends decoy player responses with boolean ad fields and
+  // checks whether the browser alters them. Touching one of those makes the
+  // player refuse to start. Only real payloads are cleaned: a player response
+  // carries playback data, and a browse/next response carries content.
+  function endpointKind(url) {
+    return /youtubei\/v1\/player/.test(String(url || '')) ? 'player' : 'browse';
+  }
+
+  function looksLikePlayer(value) {
+    return !!(value && typeof value === 'object' &&
+      (value.streamingData || value.videoDetails || value.playabilityStatus));
+  }
+
+  function isRealPayload(data, kind) {
+    if (!data || typeof data !== 'object') return false;
+    if (Array.isArray(data)) {
+      for (var i = 0; i < data.length; i++) {
+        if (isRealPayload(data[i], kind)) return true;
+      }
+      return false;
+    }
+    if (looksLikePlayer(data)) return true;
+    // get_watch and prefetch responses wrap a full player response. YouTube
+    // uses that copy instead of issuing a separate /player call, so it has
+    // to be cleaned too.
+    if (looksLikePlayer(data.playerResponse)) return true;
+    if (kind === 'player') return false;
+    return !!(data.responseContext || data.contents || data.continuationContents ||
+      data.onResponseReceivedActions || data.onResponseReceivedEndpoints ||
+      data.frameworkUpdates);
+  }
+
+  function stateFor() {
+    return {
+      touched: 0,
+      seen: typeof WeakSet !== 'undefined' ? new WeakSet() : null
+    };
+  }
+
+  // Remove every ad field the player understands, at any depth. Arrays lose
+  // the elements that exist only to describe an ad.
+  function scrub(value, depth, state) {
+    if (!value || typeof value !== 'object' || depth > 18) return value;
+    if (state.seen) {
+      if (state.seen.has(value)) return value;
+      state.seen.add(value);
+    }
+    if (Array.isArray(value)) {
+      for (var i = value.length - 1; i >= 0; i--) {
+        if (hasAdRenderer(value[i])) {
+          value.splice(i, 1);
+          state.touched++;
+        } else {
+          scrub(value[i], depth + 1, state);
+        }
+      }
+      return value;
+    }
+    var adKeys = [
+      'adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams',
+      'adBreakParams', 'playerAdParams', 'adParams', 'adPlacementRenderer',
+      'legacyImportant'
+    ];
+    for (var k = 0; k < adKeys.length; k++) {
+      if (Object.prototype.hasOwnProperty.call(value, adKeys[k])) {
+        delete value[adKeys[k]];
+        state.touched++;
+      }
+    }
+    var names = [];
+    for (var key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) names.push(key);
+    }
+    for (var n = 0; n < names.length; n++) {
+      var name = names[n];
+      var child = value[name];
+      if (!child || typeof child !== 'object') continue;
+      if (Array.isArray(child)) {
+        for (var j = child.length - 1; j >= 0; j--) {
+          if (hasAdRenderer(child[j])) {
+            child.splice(j, 1);
+            state.touched++;
+          } else {
+            scrub(child[j], depth + 1, state);
+          }
+        }
+      } else if (hasAdRenderer(child)) {
+        delete value[name];
+        state.touched++;
+      } else {
+        scrub(child, depth + 1, state);
+      }
+    }
+    return value;
+  }
+
+  function pruneText(text, kind) {
+    if (typeof text !== 'string' || !text) return null;
+    var start = text.charAt(0);
+    if (start !== '{' && start !== '[') return null;
+    try {
+      var data = JSON.parse(text);
+      // Decoys and non-player chatter are returned exactly as they arrived.
+      if (!isRealPayload(data, kind)) return null;
+      var state = stateFor();
+      scrub(data, 0, state);
+      if (!state.touched) return null;
+      return JSON.stringify(data);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function isAdEndpoint(url) {
+    var value = String(url || '');
+    if (value.indexOf('youtubei/v1/') >= 0) {
+      return /youtubei\/v1\/(player|next|get_watch|browse|search|reel|playlist)/.test(value);
+    }
+    return value.indexOf('get_video_info') >= 0 ||
+      /\/playlist\?[^#]*list=/.test(value) ||
+      /\/watch\?[^#]*[v=]/.test(value);
+  }
+
+  // The player configuration is assigned to globals before the player script
+  // runs. Intercept the assignment so the object is clean from the first read.
+  function defineInitial(name) {
+    var stored = null;
+    var player = name === 'ytInitialPlayerResponse';
+    try {
+      Object.defineProperty(window, name, {
+        configurable: true,
+        get: function () { return stored; },
+        set: function (value) {
+          try {
+            if (value && typeof value === 'object' &&
+                (player
+                  ? looksLikePlayer(value)
+                  : !!(value.responseContext || value.contents || value.header))) {
+              scrub(value, 0, stateFor());
+            }
+          } catch (error) {}
+          stored = value;
+        }
+      });
+    } catch (error) {}
+  }
+  defineInitial('ytInitialPlayerResponse');
+  defineInitial('ytInitialData');
+
+  // fetch() carries most of YouTube's player data nowadays.
+  var nativeFetch = window.fetch;
+  if (typeof nativeFetch === 'function') {
+    window.fetch = function (input, init) {
+      var url = '';
+      try {
+        url = typeof input === 'string' ? input : (input && input.url) || '';
+      } catch (error) {}
+      var pending = nativeFetch.apply(this, arguments);
+      if (!isAdEndpoint(url)) return pending;
+      var kind = endpointKind(url);
+      return pending.then(function (response) {
+        try {
+          var type = (response.headers.get('content-type') || '').toLowerCase();
+          if (type && type.indexOf('json') < 0 &&
+              type.indexOf('javascript') < 0 &&
+              type.indexOf('text/plain') < 0) {
+            return response;
+          }
+          var clone = response.clone();
+          return clone.text().then(function (text) {
+            var pruned = pruneText(text, kind);
+            if (pruned === null) return response;
+            var headers = new Headers();
+            response.headers.forEach(function (value, name) {
+              var lower = name.toLowerCase();
+              if (lower === 'content-encoding' || lower === 'content-length') return;
+              headers.append(name, value);
+            });
+            return new Response(pruned, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: headers
+            });
+          }).catch(function () { return response; });
+        } catch (error) {
+          return response;
+        }
+      });
+    };
+  }
+
+  // Some player calls still go through XMLHttpRequest. Only requests whose
+  // URL is a player endpoint are touched; readers get a pruned string even
+  // though the native response is read-only.
+  if (typeof XMLHttpRequest !== 'undefined') {
+    var nativeText = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+    var nativeResponse = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+    var nativeOpen = XMLHttpRequest.prototype.open;
+    var nativeSend = XMLHttpRequest.prototype.send;
+    if (nativeText && nativeText.get) {
+      XMLHttpRequest.prototype.open = function (method, url) {
+        try { this.__searchAdUrl = String(url); } catch (error) {}
+        return nativeOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        var xhr = this;
+        try {
+          if (isAdEndpoint(xhr.__searchAdUrl)) {
+            xhr.addEventListener('readystatechange', function () {
+              if (xhr.readyState !== 4) return;
+              try {
+                var kind = xhr.responseType;
+                if (kind === '' || kind === 'text') {
+                  var pruned = pruneText(nativeText.get.call(xhr), endpointKind(xhr.__searchAdUrl));
+                  if (pruned !== null) {
+                    Object.defineProperty(xhr, 'responseText', {
+                      configurable: true,
+                      get: function () { return pruned; }
+                    });
+                    if (nativeResponse && nativeResponse.get) {
+                      Object.defineProperty(xhr, 'response', {
+                        configurable: true,
+                        get: function () { return pruned; }
+                      });
+                    }
+                  }
+                } else if (kind === 'json' && nativeResponse && nativeResponse.get) {
+                  var data = nativeResponse.get.call(xhr);
+                  var state = stateFor();
+                  if (isRealPayload(data, endpointKind(xhr.__searchAdUrl))) {
+                    scrub(data, 0, state);
+                  }
+                  if (state.touched) {
+                    Object.defineProperty(xhr, 'response', {
+                      configurable: true,
+                      get: function () { return data; }
+                    });
+                  }
+                }
+              } catch (error) {}
+            });
+          }
+        } catch (error) {}
+        return nativeSend.apply(this, arguments);
+      };
+    }
+  }
+
+  // Cosmetic safety net: the content blocker hides the known ad containers,
+  // but new layouts appear first with these names. A small local sheet keeps
+  // the gap from flashing before the list catches up.
+  function ensureStyle() {
+    try {
+      var style = document.getElementById('search-youtube-clean');
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'search-youtube-clean';
+        style.textContent =
+          '#player-ads,#masthead-ad,#offer-module,ytd-display-ad-renderer,' +
+          'ytd-promoted-sparkles-web-renderer,ytd-ad-slot-renderer,' +
+          'ytd-in-feed-ad-layout-renderer,ytd-promoted-video-renderer,' +
+          'ytd-banner-promo-renderer,ytd-video-masthead-ad-v3-renderer,' +
+          'ytd-primetime-promo-renderer,.ytp-ad-overlay-container{display:none!important}';
+        (document.head || document.documentElement).appendChild(style);
+      }
+    } catch (error) {}
+  }
+
+  // Last line of defence for ads that still reach the player: press their
+  // skip or close buttons as soon as they appear. Seeking the ad video itself
+  // stalls the media pipeline, so it is deliberately left alone.
+  function nudgePlayer() {
+    var player = document.getElementById('movie_player') ||
+      document.querySelector('.html5-video-player');
+    if (!player || !player.classList) return;
+    if (!player.classList.contains('ad-showing')) return;
+    var buttons = player.querySelectorAll(
+      '.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,' +
+      '.ytp-ad-overlay-close-button'
+    );
+    for (var i = 0; i < buttons.length; i++) {
+      try { buttons[i].click(); } catch (error) {}
+    }
+  }
+
+  ensureStyle();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensureStyle);
+    document.addEventListener('DOMContentLoaded', nudgePlayer);
+  }
+  setInterval(nudgePlayer, 400);
+})();
+"#;
+
+const READER_SCRIPT: &str = r#"
+(function () {
+  try {
+    if (window.__searchReader) { location.reload(); return; }
+    const score = function (element) {
+      if (!element) return -1;
+      const text = (element.innerText || '').trim();
+      if (text.length < 140) return -1;
+      let links = 0;
+      element.querySelectorAll('a').forEach(function (a) { links += (a.innerText || '').length; });
+      return text.length - links * 1.6 + element.querySelectorAll('p').length * 45;
+    };
+    const candidates = [
+      document.querySelector('article'),
+      document.querySelector('main'),
+      document.querySelector('[role="main"]'),
+      document.querySelector('.post-content'),
+      document.querySelector('.article-body'),
+      document.querySelector('#content'),
+      document.body,
+    ];
+    let best = null;
+    let bestScore = -1;
+    for (const candidate of candidates) {
+      const value = score(candidate);
+      if (value > bestScore) { bestScore = value; best = candidate; }
+    }
+    if (!best) return;
+    const clone = best.cloneNode(true);
+    clone.querySelectorAll('script,style,noscript,nav,aside,footer,header,form,button,iframe,video,audio,svg,object,embed').forEach(function (node) { node.remove(); });
+    clone.querySelectorAll('h1').forEach(function (node) { if ((node.innerText || '').trim() === document.title.trim()) node.remove(); });
+    const title = document.title || '';
+    const dark = !!window.__searchReaderDark;
+    const escaped = title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const style = document.createElement('style');
+    style.textContent = `
+      html, body { background: ${dark ? '#1c1c1c' : '#ffffff'} !important; color: ${dark ? '#e8e8e8' : '#1a1a1a'} !important; }
+      body { margin: 0 !important; }
+      .search-reader { max-width: 680px; margin: 0 auto; padding: 56px 26px 120px; font: 19px/1.68 "Iowan Old Style", "Charter", "Cantarell", Georgia, serif; }
+      .search-reader h1 { font-size: 34px; line-height: 1.18; letter-spacing: -0.02em; margin: 0 0 26px; }
+      .search-reader h2, .search-reader h3 { line-height: 1.3; margin: 34px 0 12px; }
+      .search-reader p { margin: 0 0 22px; }
+      .search-reader a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+      .search-reader img, .search-reader video { max-width: 100%; height: auto; border-radius: 6px; }
+      .search-reader pre, .search-reader code { font-family: ui-monospace, monospace; font-size: 14px; background: ${dark ? '#2a2a2a' : '#f2f2f2'}; }
+      .search-reader pre { padding: 14px; overflow: auto; border-radius: 8px; }
+      .search-reader blockquote { margin: 26px 0; padding-left: 18px; border-left: 3px solid ${dark ? '#555' : '#ddd'}; color: ${dark ? '#bbb' : '#555'}; }
+      .search-reader figcaption { font-size: 13px; color: #888; }
+      .search-reader hr { border: 0; border-top: 1px solid ${dark ? '#333' : '#e5e5e5'}; margin: 34px 0; }
+    `;
+    document.head.innerHTML = '<meta name="viewport" content="width=device-width, initial-scale=1">';
+    document.head.appendChild(style);
+    document.title = title;
+    document.body.innerHTML = '';
+    const article = document.createElement('article');
+    article.className = 'search-reader';
+    if (title) {
+      const heading = document.createElement('h1');
+      heading.textContent = title;
+      article.appendChild(heading);
+    }
+    const body = document.createElement('div');
+    body.innerHTML = clone.innerHTML;
+    article.appendChild(body);
+    document.body.appendChild(article);
+    window.__searchReader = true;
+  } catch (error) {}
+})();
+"#;
+
+const VEIL_PICKER_SCRIPT: &str = r#"
+(function () {
+  if (window.__searchVeilPicker) return;
+  window.__searchVeilPicker = true;
+  let last = null;
+  const style = document.createElement('style');
+  style.id = 'search-veil-picker-style';
+  style.textContent = '.__search_veil_hover{outline:2px solid #3b82f6 !important;outline-offset:-2px !important;cursor:crosshair !important}';
+  (document.head || document.documentElement).appendChild(style);
+  const path = function (element) {
+    if (!element || element.nodeType !== 1) return '';
+    if (element.id) return '#' + CSS.escape(element.id);
+    const parts = [];
+    let node = element;
+    while (node && node.nodeType === 1 && parts.length < 7) {
+      let part = node.nodeName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const classes = Array.from(node.classList).filter(function (name) { return name.indexOf('__search') !== 0; }).slice(0, 2);
+        if (classes.length) part += '.' + classes.map(function (name) { return CSS.escape(name); }).join('.');
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const same = Array.from(parent.children).filter(function (child) { return child.nodeName === node.nodeName; });
+        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+      }
+      parts.unshift(part);
+      const candidate = parts.join(' > ');
+      try { if (document.querySelectorAll(candidate).length === 1) return candidate; } catch (error) {}
+      node = parent;
+    }
+    return parts.join(' > ');
+  };
+  const labelFor = function (element) {
+    const text = (element.innerText || element.getAttribute('aria-label') || element.getAttribute('alt') || '').trim().replace(/\s+/g, ' ');
+    if (text) return text.slice(0, 60);
+    return element.nodeName.toLowerCase();
+  };
+  const finish = function () {
+    window.__searchVeilPicker = false;
+    document.removeEventListener('mousemove', move, true);
+    document.removeEventListener('click', click, true);
+    document.removeEventListener('keydown', key, true);
+    if (last) last.classList.remove('__search_veil_hover');
+    const picker = document.getElementById('search-veil-picker-style');
+    if (picker) picker.remove();
+  };
+  const move = function (event) {
+    if (last) last.classList.remove('__search_veil_hover');
+    last = event.target;
+    if (last && last.classList) last.classList.add('__search_veil_hover');
+  };
+  const click = function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const element = event.target;
+    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.search) {
+      window.webkit.messageHandlers.search.postMessage(JSON.stringify({
+        action: 'veil-pick',
+        selector: path(element),
+        label: labelFor(element),
+      }));
+    }
+    finish();
+  };
+  const key = function (event) {
+    if (event.key === 'Escape') { event.preventDefault(); finish(); }
+  };
+  document.addEventListener('mousemove', move, true);
+  document.addEventListener('click', click, true);
+  document.addEventListener('keydown', key, true);
+})();
+"#;
+
+// ------------------------------------------------------------------- types
+
+pub struct Tab {
+    pub id: u64,
+    pub view: WebView,
+    pub manager: UserContentManager,
+    pub kind: PageKind,
+    pub title: String,
+    pub url: String,
+    pub pin: Option<String>,
+    pub name: Option<String>,
+    pub home: Option<String>,
+    pub muted: bool,
+    pub reader: bool,
+    pub private: bool,
+    /// True while the page is not loaded into a web process: either a tab
+    /// restored from the last session that has not been opened yet, or a
+    /// background tab whose process was released to give memory back.
+    pub suspended: bool,
+    pub last_used: Instant,
+    /// Whether this tab's content manager currently carries the filter.
+    pub filtered: bool,
+    /// A transient failure retries itself once. This remembers that the
+    /// automatic second chance has already been spent for this navigation.
+    pub retried: Cell<bool>,
+    /// True while the automatic second chance is being loaded, so its own
+    /// Started event does not clear `retried` and open an endless loop.
+    pub retrying: Cell<bool>,
+    pub favicon: Option<gdk_pixbuf::Pixbuf>,
+}
+
+impl Tab {
+    fn display_title(&self) -> String {
+        if let Some(name) = self.name.as_ref().filter(|n| !n.trim().is_empty()) {
+            return name.clone();
+        }
+        if !self.title.trim().is_empty() {
+            return self.title.clone();
+        }
+        if self.kind == PageKind::Blank {
+            return "New Tab".into();
+        }
+        if self.url.is_empty() {
+            return "New Tab".into();
+        }
+        store::pretty_url(&self.url)
+    }
+}
+
+pub struct DownloadRecord {
+    view: DownloadView,
+    download: Download,
+}
+
+#[derive(Clone)]
+struct Suggestion {
+    title: String,
+    detail: String,
+    url: String,
+    kind: &'static str,
+    letter: String,
+}
+
+// Commands that can be reached from the address field. Every row is shown
+// only when what the reader is typing matches its title or one of its
+// aliases, so they never get in the way of ordinary searches.
+struct PaletteItem {
+    title: &'static str,
+    detail: &'static str,
+    kind: &'static str,
+    target: &'static str,
+    letter: &'static str,
+    aliases: &'static [&'static str],
+}
+
+impl PaletteItem {
+    const fn action(
+        title: &'static str,
+        detail: &'static str,
+        target: &'static str,
+        letter: &'static str,
+        aliases: &'static [&'static str],
+    ) -> Self {
+        Self { title, detail, kind: "command", target, letter, aliases }
+    }
+
+    const fn setting(
+        title: &'static str,
+        detail: &'static str,
+        aliases: &'static [&'static str],
+    ) -> Self {
+        Self {
+            title,
+            detail,
+            kind: "setting",
+            target: "",
+            letter: "⚙",
+            aliases,
+        }
+    }
+}
+
+const PALETTE: &[PaletteItem] = &[
+    PaletteItem::action(
+        "New tab",
+        "Action · Ctrl+T",
+        "new-tab",
+        "+",
+        &[
+            "new tab", "open tab", "add tab", "nueva pestaña", "nueva pestana",
+            "añadir pestaña", "anadir pestana", "abrir pestaña", "abrir pestana",
+            "crear pestaña", "crear pestana",
+        ],
+    ),
+    PaletteItem::action(
+        "New private tab",
+        "Incognito · Ctrl+Shift+N",
+        "new-private",
+        "◐",
+        &[
+            "private tab", "private window", "private browsing", "incognito",
+            "incognito window", "nueva ventana privada", "ventana incognito",
+            "ventana privada", "nueva pestaña privada", "navegacion privada",
+            "navegación privada", "privado",
+        ],
+    ),
+    PaletteItem::action(
+        "Open settings",
+        "Action · Ctrl+,",
+        "settings",
+        "⚙",
+        &["settings", "preferences", "ajustes", "configuracion", "configuración", "opciones"],
+    ),
+    PaletteItem::action("History", "Action · Ctrl+H", "history", "◷", &["history", "historial"]),
+    PaletteItem::action(
+        "Bookmarks",
+        "Action · Ctrl+Shift+B",
+        "bookmarks",
+        "☆",
+        &["bookmarks", "favoritos", "marcadores"],
+    ),
+    PaletteItem::action("Downloads", "Action · Ctrl+J", "downloads", "↓", &["downloads", "descargas"]),
+    PaletteItem::action(
+        "Passwords",
+        "Action",
+        "passwords",
+        "⚿",
+        &["passwords", "contraseñas", "contrasenas", "gestor de contraseñas"],
+    ),
+    PaletteItem::action(
+        "Hidden elements",
+        "Action",
+        "hidden",
+        "◌",
+        &["hidden elements", "hidden", "elementos ocultos", "ocultos"],
+    ),
+    PaletteItem::action(
+        "Reading mode",
+        "Action · Ctrl+Shift+R",
+        "reader",
+        "◇",
+        &["reading mode", "reader", "modo lectura", "lectura"],
+    ),
+    PaletteItem::action(
+        "Split view",
+        "Action · Ctrl+Alt+N",
+        "split",
+        "◫",
+        &["split view", "split", "vista dividida", "dividir pantalla"],
+    ),
+    PaletteItem::action(
+        "Find on page",
+        "Action · Ctrl+F",
+        "find",
+        "⌕",
+        &["find on page", "find", "buscar en pagina", "buscar en página"],
+    ),
+    // Settings sections.
+    PaletteItem::setting("General", "Settings · General", &["general", "ajustes generales"]),
+    PaletteItem::setting("Appearance", "Settings · Appearance", &["appearance", "apariencia", "aspecto"]),
+    PaletteItem::setting("Tabs", "Settings · Tabs", &["tabs settings", "pestañas", "pestanas"]),
+    PaletteItem::setting("Browsing", "Settings · Browsing", &["browsing", "navegacion", "navegación"]),
+    PaletteItem::setting("Privacy", "Settings · Privacy", &["privacy", "privacidad"]),
+    PaletteItem::setting("Passwords settings", "Settings · Passwords", &["passwords settings", "ajustes de contraseñas"]),
+    PaletteItem::setting("About", "Settings · About", &["about", "acerca de", "informacion", "información"]),
+    // General.
+    PaletteItem::setting(
+        "Search engine",
+        "Settings · General",
+        &["search engine", "engine", "buscador", "motor de busqueda", "motor de búsqueda"],
+    ),
+    PaletteItem::setting(
+        "Custom search address",
+        "Settings · General",
+        &["custom search", "custom engine", "direccion de busqueda", "dirección de búsqueda"],
+    ),
+    PaletteItem::setting(
+        "Downloads folder",
+        "Settings · General",
+        &["downloads folder", "carpeta de descargas"],
+    ),
+    PaletteItem::setting(
+        "Ask where to save",
+        "Settings · General",
+        &["ask where to save", "preguntar donde guardar", "preguntar dónde guardar"],
+    ),
+    PaletteItem::setting(
+        "Restore tabs at launch",
+        "Settings · General",
+        &["restore tabs", "restore session", "restaurar pestañas", "restaurar pestanas", "restaurar sesion"],
+    ),
+    PaletteItem::setting(
+        "Start with a fresh window",
+        "Settings · General",
+        &["fresh window", "start fresh", "ventana nueva", "empezar de cero"],
+    ),
+    PaletteItem::setting(
+        "Confirm before quitting",
+        "Settings · General",
+        &["confirm quit", "confirmar salida", "confirmar antes de salir"],
+    ),
+    // Appearance.
+    PaletteItem::setting(
+        "Look",
+        "Settings · Appearance",
+        &["look", "theme", "tema", "dark mode", "light mode", "modo oscuro", "modo claro"],
+    ),
+    PaletteItem::setting(
+        "Page as a card",
+        "Settings · Appearance",
+        &["card", "page card", "tarjeta", "pagina como tarjeta", "página como tarjeta"],
+    ),
+    PaletteItem::setting(
+        "Bookmarks bar",
+        "Settings · Appearance",
+        &["bookmarks bar", "barra de marcadores", "barra de favoritos"],
+    ),
+    PaletteItem::setting(
+        "Compact tab strip",
+        "Settings · Appearance",
+        &["compact tabs", "compact strip", "pestañas compactas", "pestanas compactas"],
+    ),
+    PaletteItem::setting(
+        "Roomy tabs",
+        "Settings · Appearance",
+        &["roomy tabs", "pestañas amplias", "pestanas amplias"],
+    ),
+    PaletteItem::setting(
+        "Tabs wear",
+        "Settings · Appearance",
+        &["tab wear", "tab icons", "tab letters", "iconos", "letras"],
+    ),
+    PaletteItem::setting(
+        "Reduce animations",
+        "Settings · Appearance",
+        &["reduce animations", "animations", "animaciones", "reducir animaciones"],
+    ),
+    // Tabs.
+    PaletteItem::setting(
+        "Tabs in the sidebar",
+        "Settings · Tabs",
+        &["sidebar tabs", "tabs sidebar", "barra lateral", "pestañas laterales", "pestanas laterales"],
+    ),
+    PaletteItem::setting(
+        "Auto-hide sidebar",
+        "Settings · Tabs",
+        &["auto hide sidebar", "autohide sidebar", "ocultar barra lateral"],
+    ),
+    PaletteItem::setting(
+        "Sidebar on the right",
+        "Settings · Tabs",
+        &["sidebar right", "barra lateral derecha"],
+    ),
+    PaletteItem::setting(
+        "New tabs open",
+        "Settings · Tabs",
+        &["new tab position", "where new tabs open", "posicion de pestañas", "posición de pestañas"],
+    ),
+    PaletteItem::setting(
+        "Show shortcut numbers",
+        "Settings · Tabs",
+        &["shortcut numbers", "tab numbers", "numeros de atajo", "números de atajo"],
+    ),
+    PaletteItem::setting(
+        "Keep selected sites awake",
+        "Settings · Tabs",
+        &["keep awake", "keep sites awake", "mantener despierto", "sitios despiertos"],
+    ),
+    PaletteItem::setting(
+        "Put inactive tabs to sleep",
+        "Settings · Tabs",
+        &["sleep tabs", "tab sleep", "dormir pestañas", "suspender pestañas"],
+    ),
+    // Browsing.
+    PaletteItem::setting(
+        "uBlock filters",
+        "Settings · Browsing",
+        &["ublock", "adblock", "ads", "anuncios", "bloqueo de anuncios", "filtros ublock"],
+    ),
+    PaletteItem::setting(
+        "Darken pages",
+        "Settings · Browsing",
+        &["darken pages", "dark pages", "page dark", "modo oscuro", "oscurecer paginas", "oscurecer páginas"],
+    ),
+    PaletteItem::setting(
+        "Reading mode follows the look",
+        "Settings · Browsing",
+        &["reader follows look", "reading mode look", "lectura sigue el tema"],
+    ),
+    PaletteItem::setting(
+        "Wait for play",
+        "Settings · Browsing",
+        &["wait for play", "autoplay", "reproduccion automatica", "reproducción automática"],
+    ),
+    PaletteItem::setting(
+        "Show where a link goes",
+        "Settings · Browsing",
+        &["link preview", "show links", "mostrar enlaces", "destino del enlace"],
+    ),
+    PaletteItem::setting(
+        "Page zoom",
+        "Settings · Browsing",
+        &["page zoom", "zoom", "ampliacion", "ampliación"],
+    ),
+    PaletteItem::setting(
+        "Developer extras",
+        "Settings · Browsing",
+        &["developer extras", "devtools", "developer", "inspector", "desarrollador"],
+    ),
+    // Privacy.
+    PaletteItem::setting(
+        "Save passwords",
+        "Settings · Privacy",
+        &["save passwords", "guardar contraseñas", "guardar contrasenas"],
+    ),
+    PaletteItem::setting(
+        "Fill passwords",
+        "Settings · Privacy",
+        &["fill passwords", "rellenar contraseñas", "rellenar contrasenas"],
+    ),
+    PaletteItem::setting(
+        "Keep sign-ins",
+        "Settings · Privacy",
+        &["keep signins", "keep sign in", "mantener sesiones", "mantener cookies"],
+    ),
+    PaletteItem::setting(
+        "Keep session data on close",
+        "Settings · Privacy",
+        &["keep session data", "session data", "mantener datos de sesion", "mantener datos de sesión"],
+    ),
+    PaletteItem::setting(
+        "Clear browsing history",
+        "Settings · Privacy",
+        &["clear history", "clear browsing history", "borrar historial", "limpiar historial"],
+    ),
+    PaletteItem::setting(
+        "Clear cookies and site data",
+        "Settings · Privacy",
+        &["clear cookies", "clear site data", "sign out of everything", "borrar cookies", "cerrar sesion", "cerrar sesión"],
+    ),
+    PaletteItem::setting(
+        "Clear cache",
+        "Settings · Privacy",
+        &["clear cache", "borrar cache", "borrar caché"],
+    ),
+    // About.
+    PaletteItem::setting("About Search", "Settings · About", &["about search"]),
+    PaletteItem::setting(
+        "Keyboard shortcuts",
+        "Settings · About",
+        &["keyboard", "shortcuts", "atajos", "teclado"],
+    ),
+    PaletteItem::setting(
+        "What is kept, and where",
+        "Settings · About",
+        &["what is kept", "data location", "datos guardados", "donde se guarda"],
+    ),
+];
+
+#[derive(Clone)]
+pub enum ToastCommand {
+    SaveLogin,
+    UndoVeil(String),
+    UblockResume(String),
+}
+
+pub struct Omni {
+    layer: gtk::EventBox,
+    card: gtk::Box,
+    entry: gtk::Entry,
+    list: gtk::Box,
+    scroll: gtk::ScrolledWindow,
+    items: RefCell<Vec<Suggestion>>,
+    rows: RefCell<Vec<gtk::Widget>>,
+    selected: Cell<usize>,
+    open: Cell<bool>,
+}
+
+const PAGE_RADIUS: i32 = 10;
+const PAGE_PAD: i32 = 1;
+const PAGE_MASK: i32 = PAGE_RADIUS + PAGE_PAD;
+const TOP_BAR_HEIGHT: i32 = 52;
+
+/// The corner patch that sits over a web view. The card's own rounded
+/// background does not clip its children, so this redraws the frame outside
+/// the corner, the 1 px border along the arc, and lets the page show through
+/// the inside. Coverage is supersampled so the curve and the border match the
+/// straight edges without a stair-step or a seam.
+fn page_corner(radius: i32, pad: i32, corner: u8, frame: gdk::RGBA, edge: gdk::RGBA) -> gdk_pixbuf::Pixbuf {
+    let size = radius + pad;
+    let outer = radius as f64;
+    let inner = outer - 1.0;
+    // The centre of the rounded rect lies just outside the mask on the two
+    // sides that face away from the card's interior.
+    let (cx, cy) = match corner {
+        0 => (size as f64, size as f64),
+        1 => (0.0, size as f64),
+        2 => (size as f64, 0.0),
+        _ => (0.0, 0.0),
+    };
+    let samples = 8;
+    let total = (samples * samples) as f64;
+    let mut bytes = vec![0u8; (size * size * 4) as usize];
+    for py in 0..size {
+        for px in 0..size {
+            let mut frame_hits = 0u32;
+            let mut edge_hits = 0u32;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let x = px as f64 + (sx as f64 + 0.5) / samples as f64;
+                    let y = py as f64 + (sy as f64 + 0.5) / samples as f64;
+                    let dx = x - cx;
+                    let dy = y - cy;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d >= outer {
+                        frame_hits += 1;
+                    } else if d >= inner {
+                        edge_hits += 1;
+                    }
+                }
+            }
+            let hits = frame_hits + edge_hits;
+            if hits == 0 {
+                continue;
+            }
+            let alpha = hits as f64 / total;
+            let mix = |f: f64, e: f64| {
+                (f * frame_hits as f64 + e * edge_hits as f64) / hits as f64
+            };
+            let index = ((py * size + px) * 4) as usize;
+            bytes[index] = (mix(frame.red(), edge.red()) * 255.0).round() as u8;
+            bytes[index + 1] = (mix(frame.green(), edge.green()) * 255.0).round() as u8;
+            bytes[index + 2] = (mix(frame.blue(), edge.blue()) * 255.0).round() as u8;
+            bytes[index + 3] = (alpha * 255.0).round() as u8;
+        }
+    }
+    gdk_pixbuf::Pixbuf::from_mut_slice(
+        bytes,
+        gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        size,
+        size,
+        size * 4,
+    )
+}
+
+pub struct Browser {
+    pub app: gtk::Application,
+    pub window: gtk::ApplicationWindow,
+    pub this: Weak<Browser>,
+
+    pub prefs: RefCell<Prefs>,
+    pub history: RefCell<History>,
+    pub bookmarks: RefCell<Bookmarks>,
+    pub curtain: RefCell<Curtain>,
+    pub vault: RefCell<Vault>,
+
+    pub tabs: RefCell<Vec<Tab>>,
+    pub active: Cell<usize>,
+    pub next_id: Cell<u64>,
+    pub last_closed: RefCell<Vec<SessionTab>>,
+    pub downloads: RefCell<Vec<DownloadRecord>>,
+    pub pending_fill: RefCell<Option<(String, String, String)>>,
+    pub pending_login: RefCell<Option<(String, String, String)>>,
+    pub last_host: RefCell<String>,
+    pub split_second: Cell<Option<u64>>,
+    pub loading_session: Cell<bool>,
+    pub last_download_refresh: Cell<u64>,
+    pub session_save_source: RefCell<Option<glib::SourceId>>,
+    /// The loading state last drawn on the reload buttons, so repeated header
+    /// refreshes do not rebuild three icons for no visible change.
+    pub reload_shows_stop: Cell<Option<bool>>,
+
+    pub context: WebContext,
+    pub private_context: WebContext,
+    pub filter_store: *mut webkit2gtk::ffi::WebKitUserContentFilterStore,
+    pub filter: RefCell<Option<*mut webkit2gtk::ffi::WebKitUserContentFilter>>,
+    /// Whether the compiled uBlock filter has been loaded (or failed to
+    /// load). A web page waits for this before its first request so ads are
+    /// never let through on the opening view.
+    pub filter_ready: Cell<bool>,
+
+    pub overlay: gtk::Overlay,
+    pub root: gtk::Box,
+    pub main: gtk::Box,
+    pub chrome: gtk::Box,
+    pub side_top: gtk::Box,
+    pub sidebar: gtk::Box,
+    pub sidebar_revealer: gtk::Revealer,
+    pub sidebar_edge: gtk::EventBox,
+    pub top_bar: gtk::Box,
+    pub top_left: gtk::Box,
+    pub top_left_revealer: gtk::Revealer,
+    pub top_revealer: gtk::Revealer,
+    pub top_url_bar: gtk::Box,
+    pub top_url_revealer: gtk::Revealer,
+    pub top_edge: gtk::EventBox,
+    pub top_revealed: Cell<bool>,
+    pub top_controls_pinned: Cell<bool>,
+    pub top_bar_full: Cell<bool>,
+    pub top_back: gtk::Button,
+    pub top_forward: gtk::Button,
+    pub top_reload: gtk::Button,
+    pub top_address: gtk::Button,
+    pub top_url: gtk::Label,
+    pub top_hide_source: RefCell<Option<glib::SourceId>>,
+    pub pins_wrap: gtk::Box,
+    pub pins: gtk::Box,
+    pub rows: gtk::Box,
+    pub rows_scroll: gtk::ScrolledWindow,
+    pub active_pill: RefCell<Option<gtk::Widget>>,
+    pub strip_wrap: gtk::Box,
+    pub strip_scroll: gtk::ScrolledWindow,
+    pub strip: gtk::Box,
+    pub bookmarks_bar: gtk::Box,
+    pub page_wrap: gtk::Box,
+    pub page_card: gtk::Box,
+    pub page_corners: Vec<gtk::Image>,
+    pub paned: gtk::Paned,
+    pub stack: gtk::Stack,
+
+    pub back: gtk::Button,
+    pub forward: gtk::Button,
+    pub reload_button: gtk::Button,
+    pub strip_back: gtk::Button,
+    pub strip_forward: gtk::Button,
+    pub strip_reload: gtk::Button,
+    pub address: gtk::Button,
+    pub address_label: gtk::Label,
+    pub ublock_button: gtk::Button,
+    pub ublock_side: gtk::Button,
+    pub sidebar_toggle: gtk::Button,
+    pub new_tab_button: gtk::Button,
+    pub menu_button: gtk::MenuButton,
+    pub menu_side_button: gtk::MenuButton,
+    pub bookmarks_button: gtk::Button,
+    pub downloads_button: gtk::Button,
+    pub side_bookmarks: gtk::Button,
+    pub side_downloads: gtk::Button,
+
+    pub find_card: gtk::Box,
+    pub find_entry: gtk::Entry,
+    pub find_status: gtk::Label,
+    pub link_hint: gtk::Label,
+    pub omni: Omni,
+
+    pub toast: gtk::Box,
+    pub toast_label: gtk::Label,
+    pub toast_button: gtk::Button,
+    pub toast_command: RefCell<Option<ToastCommand>>,
+    pub toast_seq: Cell<u64>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn kind_for(url: &str) -> PageKind {
+    if url.is_empty() || url == "about:blank" {
+        return PageKind::Blank;
+    }
+    pages::page_kind_for_url(url).unwrap_or(PageKind::Web)
+}
+
+fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+        .collect();
+    let name = if safe.trim().is_empty() { "download" } else { safe.trim() };
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    };
+    for number in 1..10_000 {
+        let candidate = dir.join(format!("{} ({}){}", stem, number, extension));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{}-{}", store::uuid4(), name))
+}
+
+// -------------------------------------------------------------------- new
+
+impl Browser {
+    pub fn new(app: &gtk::Application) -> Rc<Self> {
+        let prefs = Prefs::load();
+        store::ensure_dir(&store::data_dir());
+        util::install_css(&prefs.look);
+
+        // Headless GTK backends (Broadway, some VNC setups) report an unknown
+        // screen resolution of -1 DPI. WebKit derives its device scale factor
+        // from that value and then lays pages out at 96x their real size.
+        // Normalising only the *unset* case to the standard 96 DPI avoids that
+        // without overriding a real desktop's font DPI.
+        if let Some(screen) = gdk::Screen::default() {
+            if screen.resolution() < 0.0 {
+                if let Some(settings) = gtk::Settings::default() {
+                    if settings.property::<i32>("gtk-xft-dpi") < 0 {
+                        settings.set_property("gtk-xft-dpi", 96 * 1024);
+                    }
+                }
+            }
+        }
+
+        let web_dir = store::data_dir().join("web");
+        let cache_dir = store::data_dir().join("cache");
+        store::ensure_dir(&web_dir);
+        store::ensure_dir(&cache_dir);
+        let data_manager = WebsiteDataManager::builder()
+            .base_data_directory(web_dir.to_string_lossy().to_string())
+            .base_cache_directory(cache_dir.to_string_lossy().to_string())
+            .build();
+        let context = WebContext::with_website_data_manager(&data_manager);
+        let favicon_dir = store::data_dir().join("favicons").to_string_lossy().to_string();
+        context.set_favicon_database_directory(Some(&favicon_dir));
+        context.set_cache_model(CacheModel::DocumentBrowser);
+        if let Some(cookies) = context.cookie_manager() {
+            // Without an explicit persistent store the cookie manager keeps
+            // every cookie in memory and forgets it as soon as the network
+            // process exits, which is why signed-in sites asked to sign in
+            // again on every launch.
+            let cookie_path = web_dir.join("cookies.sqlite3");
+            cookies.set_persistent_storage(
+                &cookie_path.to_string_lossy(),
+                CookiePersistentStorage::Sqlite,
+            );
+            cookies.set_accept_policy(if prefs.keeps_signins {
+                CookieAcceptPolicy::NoThirdParty
+            } else {
+                CookieAcceptPolicy::Never
+            });
+        }
+        let private_context = WebContext::new_ephemeral();
+
+        let filter_dir = store::data_dir().join("filters");
+        store::ensure_dir(&filter_dir);
+        let filter_path = CString::new(filter_dir.to_string_lossy().as_bytes()).unwrap();
+        let filter_store =
+            unsafe { webkit2gtk::ffi::webkit_user_content_filter_store_new(filter_path.as_ptr()) };
+
+        let window = gtk::ApplicationWindow::new(app);
+        window.set_title("Search");
+        window.set_default_size(1180, 780);
+        window.set_size_request(640, 420);
+        window.set_icon_name(Some("search"));
+
+        // Search has no toolbar and no title bar of the system's: the
+        // window is the page. The traffic lights sit in the strip's band
+        // when the tabs run across the top, and in the column's own corner
+        // when they run down the side, where the page begins at the very
+        // top edge. Dragging those empty bands moves the window, as a title
+        // bar would.
+        window.set_decorated(false);
+
+        let traffic = |class: &str, tooltip: &str| {
+            let button = gtk::Button::new();
+            button.set_relief(gtk::ReliefStyle::None);
+            button.set_tooltip_text(Some(tooltip));
+            button.set_size_request(12, 12);
+            button.set_valign(gtk::Align::Center);
+            button.style_context().add_class("traffic");
+            button.style_context().add_class(class);
+            button
+        };
+        let lights_row = |margin: i32| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_start(margin);
+            row.set_valign(gtk::Align::Center);
+            let close_light = traffic("traffic-close", "Close — Ctrl+Q");
+            let min_light = traffic("traffic-min", "Minimize");
+            let max_light = traffic("traffic-max", "Maximize");
+            {
+                let w = window.clone();
+                close_light.connect_clicked(move |_| {
+                    w.close();
+                });
+            }
+            {
+                let w = window.clone();
+                min_light.connect_clicked(move |_| {
+                    w.iconify();
+                });
+            }
+            {
+                let w = window.clone();
+                max_light.connect_clicked(move |_| {
+                    if w.is_maximized() {
+                        w.unmaximize();
+                    } else {
+                        w.maximize();
+                    }
+                });
+            }
+            row.pack_start(&close_light, false, false, 0);
+            row.pack_start(&min_light, false, false, 0);
+            row.pack_start(&max_light, false, false, 0);
+            row
+        };
+        let helm_button = |icon: &str, tip: &str| {
+            let button = util::button_icon(icon, tip);
+            button.style_context().add_class("helm-button");
+            button.set_size_request(26, 26);
+            button.set_valign(gtk::Align::Center);
+            if let Some(image) = button.image().and_downcast::<gtk::Image>() {
+                image.set_pixel_size(12);
+            }
+            button
+        };
+        let door_button = |icon: &str, tip: &str| {
+            let button = util::button_icon(icon, tip);
+            button.style_context().add_class("strip-door");
+            button.set_size_request(26, 26);
+            button.set_valign(gtk::Align::Center);
+            if let Some(image) = button.image().and_downcast::<gtk::Image>() {
+                image.set_pixel_size(14);
+            }
+            button
+        };
+
+        // ---- the strip's band, and the lights in it
+        let chrome = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        chrome.set_size_request(-1, 52);
+        chrome.style_context().add_class("chrome");
+        chrome.pack_start(&lights_row(19), false, false, 0);
+
+        let strip_wrap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        strip_wrap.style_context().add_class("tab-strip");
+        strip_wrap.set_margin_start(29);
+        strip_wrap.set_margin_end(10);
+        strip_wrap.set_valign(gtk::Align::Center);
+        strip_wrap.set_hexpand(true);
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        strip.set_hexpand(true);
+        strip.set_valign(gtk::Align::Center);
+        let strip_scroll = util::scrolled(&strip);
+        strip_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        strip_scroll.set_size_request(-1, 28);
+        strip_wrap.pack_start(&strip_scroll, true, true, 0);
+        chrome.pack_start(&strip_wrap, true, true, 0);
+
+        let strip_back = helm_button("go-previous-symbolic", "Back — Alt+Left");
+        let strip_forward = helm_button("go-next-symbolic", "Forward — Alt+Right");
+        let strip_reload = helm_button("view-refresh-symbolic", "Reload — Ctrl+R");
+        let strip_helm = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        strip_helm.set_valign(gtk::Align::Center);
+        strip_helm.pack_start(&strip_back, false, false, 0);
+        strip_helm.pack_start(&strip_forward, false, false, 0);
+        strip_helm.pack_start(&strip_reload, false, false, 0);
+        let strip_bookmarks = door_button("user-bookmarks-symbolic", "Bookmarks — Ctrl+Shift+B");
+        let strip_downloads = door_button("folder-download-symbolic", "Downloads — Ctrl+J");
+        let ublock_button = door_button("security-high-symbolic", "uBlock filters are on");
+        let menu_button = gtk::MenuButton::new();
+        menu_button.add(&util::image_icon("open-menu-symbolic", 14));
+        menu_button.style_context().add_class("strip-door");
+        menu_button.set_tooltip_text(Some("Search"));
+        menu_button.set_valign(gtk::Align::Center);
+        menu_button.set_size_request(26, 26);
+        let right = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        right.style_context().add_class("strip-right");
+        right.set_valign(gtk::Align::Center);
+        right.set_margin_end(12);
+        right.pack_start(&strip_helm, false, false, 0);
+        let right_air = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        right_air.set_size_request(8, -1);
+        right.pack_start(&right_air, false, false, 0);
+        right.pack_start(&strip_bookmarks, false, false, 0);
+        right.pack_start(&strip_downloads, false, false, 0);
+        right.pack_start(&ublock_button, false, false, 0);
+        right.pack_start(&menu_button, false, false, 0);
+        chrome.pack_end(&right, false, false, 0);
+
+        // ---- the bar that waits at the top edge
+        // Reaching the top uncovers a full bar (lights, navigation, address)
+        // over the page column. When the column is folded away the bar also
+        // carries the lights and helm; when the column is open, those stay
+        // with it and this left strip folds to zero instead.
+        let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_bar.set_size_request(-1, 52);
+        top_bar.style_context().add_class("top-bar");
+        let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_left.set_size_request(prefs.side_width, -1);
+        top_left.pack_start(&lights_row(19), false, false, 0);
+        let top_back = helm_button("go-previous-symbolic", "Back — Alt+Left");
+        let top_forward = helm_button("go-next-symbolic", "Forward — Alt+Right");
+        let top_reload = helm_button("view-refresh-symbolic", "Reload — Ctrl+R");
+        let top_nav = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        top_nav.set_valign(gtk::Align::Center);
+        top_nav.pack_start(&top_back, false, false, 0);
+        top_nav.pack_start(&top_forward, false, false, 0);
+        top_nav.pack_start(&top_reload, false, false, 0);
+        // Same gap as the column's own header, so the two sets of controls
+        // sit exactly on top of each other while one bar replaces the other.
+        let top_helm_air = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_helm_air.set_size_request(19, -1);
+        top_left.pack_start(&top_helm_air, false, false, 0);
+        top_left.pack_start(&top_nav, false, false, 0);
+        // This strip only exists while the column is folded away. As the
+        // column slides out, the strip folds against its right edge, so the
+        // controls it holds stay put at the window's left edge and are
+        // simply handed over to the column's own identical row.
+        let top_left_revealer = gtk::Revealer::new();
+        top_left_revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        top_left_revealer.set_transition_duration(180);
+        top_left_revealer.set_reveal_child(true);
+        top_left_revealer.add(&top_left);
+        top_bar.pack_start(&top_left_revealer, false, false, 0);
+        let top_address = gtk::Button::new();
+        top_address.set_relief(gtk::ReliefStyle::None);
+        top_address.style_context().add_class("top-address");
+        top_address.set_tooltip_text(Some("Open address — Ctrl+L"));
+        top_address.set_hexpand(true);
+        top_address.set_margin_start(10);
+        top_address.set_margin_end(14);
+        top_address.set_valign(gtk::Align::Center);
+        let top_url = gtk::Label::new(Some("Search or enter address"));
+        top_url.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        top_url.set_xalign(0.0);
+        top_url.set_width_chars(30);
+        top_url.set_max_width_chars(120);
+        top_address.add(&top_url);
+        let top_url_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_url_bar.set_size_request(-1, 52);
+        top_url_bar.pack_start(&top_address, true, true, 0);
+        let top_url_revealer = gtk::Revealer::new();
+        top_url_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        top_url_revealer.set_transition_duration(160);
+        top_url_revealer.set_reveal_child(false);
+        top_url_revealer.add(&top_url_bar);
+        top_url_revealer.set_halign(gtk::Align::Fill);
+        top_url_revealer.set_valign(gtk::Align::Start);
+
+        // The bar stays hidden until the pointer reaches the top edge,
+        // then drops down above the page.
+        let top_revealer = gtk::Revealer::new();
+        top_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        top_revealer.set_transition_duration(160);
+        top_revealer.set_reveal_child(false);
+        top_revealer.add(&top_bar);
+        top_revealer.set_halign(gtk::Align::Fill);
+        top_revealer.set_valign(gtk::Align::Start);
+
+        // The same thin edge trick as the column: a band at the very top
+        // brings the bar back once it has gone.
+        let top_edge = gtk::EventBox::new();
+        top_edge.set_visible_window(true);
+        top_edge.set_size_request(-1, 6);
+        top_edge.style_context().add_class("top-edge");
+        top_edge.set_halign(gtk::Align::Fill);
+        top_edge.set_valign(gtk::Align::Start);
+
+        // The floating omnibox (Ctrl+L) is the address field; the button is
+        // kept for the shortcut and for a tooltip, never packed.
+        let address = gtk::Button::new();
+        address.set_relief(gtk::ReliefStyle::None);
+        address.style_context().add_class("address-button");
+        let address_label = gtk::Label::new(Some("Search or enter address"));
+        address_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        address_label.set_width_chars(44);
+        address_label.set_max_width_chars(70);
+        address_label.set_xalign(0.5);
+        address.add(&address_label);
+        address.set_tooltip_text(Some("Search or enter an address — Ctrl+L"));
+        address.hide();
+
+        let sidebar_toggle = util::button_icon("view-list-symbolic", "Tabs in the sidebar — Ctrl+Shift+S");
+        sidebar_toggle.hide();
+        let new_tab_button = util::button_icon("tab-new-symbolic", "New tab — Ctrl+T");
+        new_tab_button.hide();
+
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        root.style_context().add_class("window-ground");
+
+        // ---- sidebar
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar.style_context().add_class("sidebar");
+        sidebar.set_size_request(prefs.side_width, -1);
+
+        // The sidebar is wrapped in a revealer so it can slide in/out with
+        // an animation (auto-hide). In normal mode the revealer is moved
+        // into the root box so it pushes the page instead of floating.
+        let sidebar_revealer = gtk::Revealer::new();
+        sidebar_revealer.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+        sidebar_revealer.set_transition_duration(180);
+        sidebar_revealer.add(&sidebar);
+        sidebar_revealer.set_reveal_child(prefs.sidebar && !prefs.auto_hide_sidebar);
+
+        // A thin strip along the left edge that brings the sidebar back when
+        // it is hidden on its own (auto-hide). Invisible until auto-hide is on.
+        let sidebar_edge = gtk::EventBox::new();
+        sidebar_edge.set_visible_window(true);
+        sidebar_edge.set_size_request(8, -1);
+        sidebar_edge.style_context().add_class("sidebar-edge");
+
+        let side_top = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        side_top.set_size_request(-1, 52);
+        side_top.style_context().add_class("side-top");
+        side_top.pack_start(&lights_row(19), false, false, 0);
+        let helm_air = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        helm_air.set_size_request(19, -1);
+        side_top.pack_start(&helm_air, false, false, 0);
+        let back = helm_button("go-previous-symbolic", "Back — Alt+Left");
+        let forward = helm_button("go-next-symbolic", "Forward — Alt+Right");
+        let reload_button = helm_button("view-refresh-symbolic", "Reload — Ctrl+R");
+        let helm = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        helm.set_valign(gtk::Align::Center);
+        helm.pack_start(&back, false, false, 0);
+        helm.pack_start(&forward, false, false, 0);
+        helm.pack_start(&reload_button, false, false, 0);
+        side_top.pack_start(&helm, false, false, 0);
+        sidebar.pack_start(&side_top, false, false, 0);
+
+        // Pinned sites are wide, short buttons in a small grid at the top of
+        // the column — one letter each, never a strip of tiny icons.
+        let pins_wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pins_wrap.set_margin_start(10);
+        pins_wrap.set_margin_end(10);
+        pins_wrap.set_margin_bottom(10);
+        let pins = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        pins_wrap.pack_start(&pins, false, false, 0);
+        sidebar.pack_start(&pins_wrap, false, false, 0);
+
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        rows.set_margin_start(10);
+        rows.set_margin_end(10);
+        let rows_scroll = util::scrolled(&rows);
+        rows_scroll.set_vexpand(true);
+        rows_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        sidebar.pack_start(&rows_scroll, true, true, 0);
+
+        // The foot: the doors Settings, History, Passwords, Bookmarks and
+        // Downloads live behind stay one click away at the bottom.
+        let foot = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        foot.style_context().add_class("sidebar-foot");
+        foot.set_margin_start(10);
+        foot.set_margin_end(10);
+        foot.set_margin_bottom(10);
+        let menu_side_button = gtk::MenuButton::new();
+        menu_side_button.add(&util::image_icon("open-menu-symbolic", 14));
+        menu_side_button.style_context().add_class("foot-button");
+        menu_side_button.set_tooltip_text(Some("Search"));
+        let ublock_side = util::button_icon("security-high-symbolic", "uBlock filters are on");
+        ublock_side.style_context().add_class("foot-button");
+        let side_bookmarks = util::button_icon("user-bookmarks-symbolic", "Bookmarks");
+        side_bookmarks.style_context().add_class("foot-button");
+        let side_downloads = util::button_icon("folder-download-symbolic", "Downloads");
+        side_downloads.style_context().add_class("foot-button");
+        for button in [&ublock_side, &side_bookmarks, &side_downloads] {
+            button.set_size_request(26, 26);
+            if let Some(image) = button.image().and_downcast::<gtk::Image>() {
+                image.set_pixel_size(13);
+            }
+        }
+        menu_side_button.set_size_request(26, 26);
+        foot.pack_start(&menu_side_button, false, false, 0);
+        foot.pack_start(&ublock_side, false, false, 0);
+        foot.pack_start(&side_bookmarks, false, false, 0);
+        foot.pack_start(&side_downloads, false, false, 0);
+        let foot_grow = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        foot_grow.set_hexpand(true);
+        foot.pack_start(&foot_grow, true, true, 0);
+        sidebar.pack_end(&foot, false, false, 0);
+
+        // ---- page
+        let bookmarks_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        bookmarks_bar.style_context().add_class("bookmarks-bar");
+
+        let page_wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page_wrap.style_context().add_class("page-ground");
+        let page_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.set_wide_handle(false);
+        let stack = gtk::Stack::new();
+        stack.set_transition_type(gtk::StackTransitionType::None);
+        stack.set_vexpand(true);
+        stack.set_hexpand(true);
+        paned.add1(&stack);
+        let page_corners: Vec<gtk::Image> = (0..4).map(|_| gtk::Image::new()).collect();
+        for (index, corner) in page_corners.iter().enumerate() {
+            corner.set_size_request(PAGE_MASK, PAGE_MASK);
+            corner.set_halign(if index % 2 == 0 {
+                gtk::Align::Start
+            } else {
+                gtk::Align::End
+            });
+            corner.set_valign(if index < 2 {
+                gtk::Align::Start
+            } else {
+                gtk::Align::End
+            });
+        }
+        page_card.pack_start(&paned, true, true, 0);
+        page_wrap.pack_start(&page_card, true, true, 0);
+
+        let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        main.pack_start(&bookmarks_bar, false, false, 0);
+        main.pack_start(&page_wrap, true, true, 0);
+        root.set_homogeneous(false);
+        sidebar.set_hexpand(false);
+        sidebar.set_hexpand_set(true);
+        main.set_hexpand(true);
+        main.set_hexpand_set(true);
+        // Only the page column drops with the bar. The column keeps its own
+        // header and rows exactly where they are, no matter what the bar is
+        // doing on the other side of the window.
+        let page_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page_column.set_hexpand(true);
+        page_column.set_hexpand_set(true);
+        page_column.pack_start(&top_revealer, false, false, 0);
+        page_column.pack_start(&main, true, true, 0);
+        root.pack_start(&sidebar_revealer, false, true, 0);
+        root.pack_start(&page_column, true, true, 0);
+
+        let overlay = gtk::Overlay::new();
+        overlay.add(&root);
+        chrome.set_halign(gtk::Align::Fill);
+        chrome.set_valign(gtk::Align::Start);
+        chrome.set_hexpand(true);
+        overlay.add_overlay(&chrome);
+        // The page's corner patches live on the window overlay so they can
+        // reach one pixel past the card and cover its square child fully.
+        for corner in &page_corners {
+            overlay.add_overlay(corner);
+        }
+        // The edge strip floats over the page. The revealer is moved to the
+        // overlay only in auto-hide mode (see apply_layout); otherwise it
+        // stays in the root box and pushes the page.
+        sidebar_edge.set_halign(gtk::Align::Start);
+        sidebar_edge.set_valign(gtk::Align::Fill);
+        overlay.add_overlay(&sidebar_edge);
+        sidebar_edge.show();
+        overlay.add_overlay(&top_edge);
+        top_edge.show();
+        top_url_revealer.set_halign(gtk::Align::Fill);
+        top_url_revealer.set_valign(gtk::Align::Start);
+        top_url_revealer.set_margin_start(prefs.side_width);
+        overlay.add_overlay(&top_url_revealer);
+        window.add(&overlay);
+
+        // The window has no frame of the system's, so its edges are pulled
+        // here: a strip along each side and a square at each corner, over
+        // everything else and transparent.
+        let edges: [(&str, gtk::Align, gtk::Align, i32, i32, &str); 8] = [
+            ("n", gtk::Align::Fill, gtk::Align::Start, -1, 4, "ns-resize"),
+            ("s", gtk::Align::Fill, gtk::Align::End, -1, 4, "ns-resize"),
+            ("w", gtk::Align::Start, gtk::Align::Fill, 4, -1, "ew-resize"),
+            ("e", gtk::Align::End, gtk::Align::Fill, 4, -1, "ew-resize"),
+            ("nw", gtk::Align::Start, gtk::Align::Start, 10, 10, "nwse-resize"),
+            ("ne", gtk::Align::End, gtk::Align::Start, 10, 10, "nesw-resize"),
+            ("sw", gtk::Align::Start, gtk::Align::End, 10, 10, "nesw-resize"),
+            ("se", gtk::Align::End, gtk::Align::End, 10, 10, "nwse-resize"),
+        ];
+        for (name, horizontal, vertical, width, height, cursor) in edges {
+            let handle = gtk::EventBox::new();
+            handle.set_visible_window(false);
+            handle.set_size_request(width, height);
+            handle.set_halign(horizontal);
+            handle.set_valign(vertical);
+            handle.set_tooltip_text(None);
+            let edge = match name {
+                "n" => gdk::WindowEdge::North,
+                "s" => gdk::WindowEdge::South,
+                "w" => gdk::WindowEdge::West,
+                "e" => gdk::WindowEdge::East,
+                "nw" => gdk::WindowEdge::NorthWest,
+                "ne" => gdk::WindowEdge::NorthEast,
+                "sw" => gdk::WindowEdge::SouthWest,
+                _ => gdk::WindowEdge::SouthEast,
+            };
+            handle.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+            let held = window.clone();
+            handle.connect_button_press_event(move |_, event| {
+                if event.button() != 1 {
+                    return glib::Propagation::Proceed;
+                }
+                let (x, y) = event.root();
+                held.begin_resize_drag(edge, 1, x as i32, y as i32, event.time());
+                glib::Propagation::Stop
+            });
+            let cursor = cursor.to_string();
+            handle.connect_realize(move |handle| {
+                if let Some(window) = handle.window() {
+                    if let Some(display) = gdk::Display::default() {
+                        if let Some(cursor) = gdk::Cursor::from_name(&display, &cursor) {
+                            window.set_cursor(Some(&cursor));
+                        }
+                    }
+                }
+            });
+            overlay.add_overlay(&handle);
+            handle.show();
+        }
+
+        // The empty bands are the title bar: drag them to move the window,
+        // double-click to fill the screen or put it back.
+        for band in [&side_top, &chrome, &strip_wrap, &top_bar] {
+            band.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+            let held = window.clone();
+            band.connect_button_press_event(move |_, event| {
+                if event.button() != 1 {
+                    return glib::Propagation::Proceed;
+                }
+                if event.as_ref().type_ == gdk::ffi::GDK_DOUBLE_BUTTON_PRESS {
+                    if held.is_maximized() {
+                        held.unmaximize();
+                    } else {
+                        held.maximize();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                let (x, y) = event.root();
+                held.begin_move_drag(1, x as i32, y as i32, event.time());
+                glib::Propagation::Stop
+            });
+        }
+
+        // ---- find
+        let find_card = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        find_card.style_context().add_class("find-card");
+        find_card.set_halign(gtk::Align::End);
+        find_card.set_valign(gtk::Align::Start);
+        find_card.set_margin_top(12);
+        find_card.set_margin_end(16);
+        let find_entry = gtk::Entry::new();
+        find_entry.style_context().add_class("find-entry");
+        find_entry.set_placeholder_text(Some("Find on page"));
+        find_entry.set_width_chars(22);
+        let find_status = util::label("", Some("find-status"));
+        let find_prev = util::button_icon("go-up-symbolic", "Previous — Shift+Enter");
+        find_prev.style_context().add_class("find-button");
+        let find_next = util::button_icon("go-down-symbolic", "Next — Enter");
+        find_next.style_context().add_class("find-button");
+        let find_close = util::button_icon("window-close-symbolic", "Close — Esc");
+        find_close.style_context().add_class("find-button");
+        find_card.pack_start(&find_entry, true, true, 0);
+        find_card.pack_start(&find_status, false, false, 0);
+        find_card.pack_start(&find_prev, false, false, 0);
+        find_card.pack_start(&find_next, false, false, 0);
+        find_card.pack_start(&find_close, false, false, 0);
+        find_card.set_no_show_all(true);
+        overlay.add_overlay(&find_card);
+
+        // ---- link hint
+        let link_hint = util::label("", Some("link-status"));
+        link_hint.set_halign(gtk::Align::Start);
+        link_hint.set_valign(gtk::Align::End);
+        link_hint.set_margin_start(12);
+        link_hint.set_margin_bottom(10);
+        link_hint.set_max_width_chars(90);
+        link_hint.set_no_show_all(true);
+        overlay.add_overlay(&link_hint);
+
+        // ---- omnibox
+        let omni_layer = gtk::EventBox::new();
+        omni_layer.set_visible_window(true);
+        omni_layer.style_context().add_class("omnibox-dim");
+        omni_layer.set_halign(gtk::Align::Fill);
+        omni_layer.set_valign(gtk::Align::Fill);
+        omni_layer.set_no_show_all(true);
+        overlay.add_overlay(&omni_layer);
+
+        let omni_card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        omni_card.style_context().add_class("omnibox-card");
+        omni_card.set_size_request(560, -1);
+        omni_card.set_halign(gtk::Align::Center);
+        omni_card.set_valign(gtk::Align::Start);
+        omni_card.set_margin_top(12);
+        omni_card.set_no_show_all(true);
+        let omni_entry = gtk::Entry::new();
+        omni_entry.style_context().add_class("omnibox-entry");
+        omni_entry.set_placeholder_text(Some("Search or enter an address"));
+        omni_entry.set_has_frame(false);
+        let omni_list = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        omni_list.style_context().add_class("omnibox-list");
+        let omni_scroll = util::scrolled(&omni_list);
+        omni_scroll.set_max_content_height(360);
+        omni_scroll.set_propagate_natural_height(true);
+        omni_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        omni_card.pack_start(&omni_entry, false, false, 0);
+        omni_card.pack_start(&omni_scroll, false, false, 0);
+        overlay.add_overlay(&omni_card);
+
+        // ---- toast
+        let toast = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        toast.style_context().add_class("toast");
+        toast.set_halign(gtk::Align::Center);
+        toast.set_valign(gtk::Align::End);
+        toast.set_margin_bottom(26);
+        toast.set_no_show_all(true);
+        let toast_label = util::label("", None);
+        let toast_button = gtk::Button::with_label("Undo");
+        toast_button.set_relief(gtk::ReliefStyle::None);
+        toast_button.style_context().add_class("plain-button");
+        toast_button.set_no_show_all(true);
+        toast.pack_start(&toast_label, false, false, 0);
+        toast.pack_start(&toast_button, false, false, 0);
+        overlay.add_overlay(&toast);
+
+        let browser = Rc::new_cyclic(|weak| Browser {
+            app: app.clone(),
+            window: window.clone(),
+            this: weak.clone(),
+            prefs: RefCell::new(prefs),
+            history: RefCell::new(History::load()),
+            bookmarks: RefCell::new(Bookmarks::load()),
+            curtain: RefCell::new(Curtain::load()),
+            vault: RefCell::new(Vault::load()),
+            tabs: RefCell::new(Vec::new()),
+            active: Cell::new(0),
+            next_id: Cell::new(1),
+            last_closed: RefCell::new(Vec::new()),
+            downloads: RefCell::new(Vec::new()),
+            pending_fill: RefCell::new(None),
+            pending_login: RefCell::new(None),
+            last_host: RefCell::new(String::new()),
+            split_second: Cell::new(None),
+            loading_session: Cell::new(false),
+            last_download_refresh: Cell::new(0),
+            session_save_source: RefCell::new(None),
+            reload_shows_stop: Cell::new(None),
+            context: context.clone(),
+            private_context,
+            filter_store,
+            filter: RefCell::new(None),
+            filter_ready: Cell::new(false),
+            overlay,
+            root,
+            main,
+            chrome,
+            side_top,
+            sidebar,
+            sidebar_revealer,
+            sidebar_edge,
+            top_bar,
+            top_left,
+            top_left_revealer,
+            top_revealer,
+            top_url_bar,
+            top_url_revealer,
+            top_edge,
+            top_revealed: Cell::new(false),
+            top_controls_pinned: Cell::new(false),
+            top_bar_full: Cell::new(false),
+            top_back,
+            top_forward,
+            top_reload,
+            top_address,
+            top_url,
+            top_hide_source: RefCell::new(None),
+            pins_wrap,
+            pins,
+            rows,
+            rows_scroll,
+            active_pill: RefCell::new(None),
+            strip_wrap,
+            strip_scroll,
+            strip,
+            bookmarks_bar,
+            page_wrap,
+            page_card,
+            page_corners,
+            paned,
+            stack,
+            back,
+            forward,
+            reload_button,
+            strip_back,
+            strip_forward,
+            strip_reload,
+            address,
+            address_label,
+            ublock_button,
+            ublock_side,
+            sidebar_toggle,
+            new_tab_button,
+            menu_button,
+            menu_side_button,
+            bookmarks_button: strip_bookmarks,
+            downloads_button: strip_downloads,
+            side_bookmarks,
+            side_downloads,
+            find_card,
+            find_entry,
+            find_status,
+            link_hint,
+            omni: Omni {
+                layer: omni_layer,
+                card: omni_card,
+                entry: omni_entry,
+                list: omni_list,
+                scroll: omni_scroll,
+                items: RefCell::new(Vec::new()),
+                rows: RefCell::new(Vec::new()),
+                selected: Cell::new(0),
+                open: Cell::new(false),
+            },
+            toast,
+            toast_label,
+            toast_button,
+            toast_command: RefCell::new(None),
+            toast_seq: Cell::new(0),
+        });
+
+        let weak = Rc::downgrade(&browser);
+        browser.build(&weak);
+        browser
+    }
+}
+
+// ------------------------------------------------------------------ wiring
+
+fn add_app_action(
+    app: &gtk::Application,
+    weak: &Weak<Browser>,
+    name: &str,
+    accels: &[&str],
+    f: Box<dyn Fn(&Rc<Browser>)>,
+) {
+    let action = gio::SimpleAction::new(name, None);
+    let weak = weak.clone();
+    action.connect_activate(move |_, _| {
+        if let Some(browser) = weak.upgrade() {
+            f(&browser);
+        }
+    });
+    app.add_action(&action);
+    app.set_accels_for_action(&format!("app.{}", name), accels);
+}
+
+fn menu_popover() -> (gtk::Popover, gtk::Box) {
+    let popover = gtk::Popover::new(None::<&gtk::Widget>);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_modal(true);
+    popover.style_context().add_class("menu-popover");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    content.set_size_request(252, -1);
+    content.set_margin_top(4);
+    content.set_margin_bottom(4);
+    content.set_margin_start(4);
+    content.set_margin_end(4);
+    popover.add(&content);
+    (popover, content)
+}
+
+fn menu_row(label: &str, accel: &str) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_relief(gtk::ReliefStyle::None);
+    button.style_context().add_class("menu-row");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let title = util::label(label, Some("menu-label"));
+    title.set_hexpand(true);
+    title.set_xalign(0.0);
+    let hint = util::label(accel, Some("menu-accel"));
+    row.pack_start(&title, true, true, 0);
+    row.pack_start(&hint, false, false, 0);
+    button.add(&row);
+    button
+}
+
+fn add_menu_item(
+    content: &gtk::Box,
+    popover: &gtk::Popover,
+    label: &str,
+    accel: &str,
+    weak: &Weak<Browser>,
+    f: Box<dyn Fn(&Rc<Browser>)>,
+) {
+    let button = menu_row(label, accel);
+    let popover = popover.clone();
+    let weak = weak.clone();
+    button.connect_clicked(move |_| {
+        popover.popdown();
+        if let Some(browser) = weak.upgrade() {
+            f(&browser);
+        }
+    });
+    content.pack_start(&button, false, false, 0);
+}
+
+impl Browser {
+    fn build(self: &Rc<Self>, weak: &Weak<Browser>) {
+        self.wire_toolbar();
+        self.wire_find();
+        self.wire_omni();
+        self.wire_toast();
+        self.build_menu(weak);
+        self.wire_shortcuts(weak);
+
+        // The strip is as wide as the window only until the tabs outgrow it;
+        // from then on it scrolls inside its edges, and the tab you are on
+        // stays in view through every resize as well as every switch.
+        let scroll_weak = self.this.clone();
+        self.strip_scroll.connect_size_allocate(move |_, _| {
+            if let Some(browser) = scroll_weak.upgrade() {
+                browser.scroll_active_into_view();
+            }
+        });
+
+        let scheme_weak = self.this.clone();
+        self.context.register_uri_scheme("search", move |request| {
+            let Some(browser) = scheme_weak.upgrade() else {
+                return;
+            };
+            let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+            let html = browser.page_html(&uri);
+            let bytes = glib::Bytes::from(html.as_bytes());
+            let stream = gio::MemoryInputStream::from_bytes(&bytes);
+            request.finish(&stream, bytes.len() as i64, Some("text/html"));
+        });
+
+        let download_weak = self.this.clone();
+        self.context
+            .connect_download_started(move |_context, download| {
+                if let Some(browser) = download_weak.upgrade() {
+                    browser.begin_download(download.clone());
+                }
+            });
+
+        let close_weak = self.this.clone();
+        self.window.connect_delete_event(move |_window, _event| {
+            if let Some(browser) = close_weak.upgrade() {
+                let many = browser.tabs.borrow().len() > 1;
+                if browser.prefs.borrow().confirm_quit
+                    && many
+                    && !browser.confirm(
+                        "Quit Search?",
+                        "Close this window and every tab in it?",
+                    )
+                {
+                    return glib::Propagation::Stop;
+                }
+                browser.flush_session();
+                browser.prefs.borrow().save();
+                if !browser.prefs.borrow().keep_session_data {
+                    if let Some(manager) = browser.context.website_data_manager() {
+                        let app = browser.app.clone();
+                        let (sender, receiver) = glib::MainContext::channel(glib::Priority::default());
+                        receiver.attach(None, move |_| {
+                            app.quit();
+                            glib::ControlFlow::Break
+                        });
+                        manager.clear(
+                            webkit2gtk::WebsiteDataTypes::ALL,
+                            glib::TimeSpan(0),
+                            None::<&gio::Cancellable>,
+                            move |_result| {
+                                let _ = sender.send(());
+                            },
+                        );
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
+        // Auto-hide sidebar. The page reports pointer motion over itself
+        // (WebKit swallows it otherwise), the window's own events cover the
+        // chrome, and the thin left-edge strip brings the column back when
+        // it is tucked away.
+        self.sidebar_edge.add_events(gdk::EventMask::ENTER_NOTIFY_MASK);
+        let edge_weak = self.this.clone();
+        self.sidebar_edge.connect_enter_notify_event(move |_, _| {
+            if let Some(browser) = edge_weak.upgrade() {
+                if browser.prefs.borrow().auto_hide_sidebar && browser.prefs.borrow().sidebar {
+                    browser.show_auto_sidebar();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        let top_edge_weak = self.this.clone();
+        self.top_edge.connect_enter_notify_event(move |_, _event| {
+            if let Some(browser) = top_edge_weak.upgrade() {
+                browser.show_top_bar();
+            }
+            glib::Propagation::Proceed
+        });
+        self.window
+            .add_events(gdk::EventMask::POINTER_MOTION_MASK);
+        let motion_weak = self.this.clone();
+        self.window.connect_motion_notify_event(move |_, _event| {
+            if let Some(browser) = motion_weak.upgrade() {
+                // Child windows (sidebar rows, event boxes) deliver motion
+                // with coordinates relative to themselves, so ask the seat
+                // for the pointer's real position in window coordinates.
+                if let Some((x, y)) = browser.pointer_position() {
+                    browser.pointer_moved(x, y);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        let enter_weak = self.this.clone();
+        self.window.connect_enter_notify_event(move |_, _event| {
+            if let Some(browser) = enter_weak.upgrade() {
+                if let Some((x, y)) = browser.pointer_position() {
+                    browser.pointer_moved(x, y);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
+        // The corner patches ride the card while the column slides in or
+        // out and while the window is resized.
+        let corner_weak = self.this.clone();
+        self.page_card.connect_size_allocate(move |_, _| {
+            if let Some(browser) = corner_weak.upgrade() {
+                browser.position_page_corners();
+            }
+        });
+
+        crate::ublock::prepare(self.filter_store, self.this.clone());
+
+        // WebKitGTK gives each view its own web process, so background tabs
+        // cost real memory even when they are only sitting there. Check once
+        // a minute and release the processes of tabs left idle.
+        let sleep_weak = self.this.clone();
+        let sleep_every = if std::env::var("SEARCH_SLEEP_SECS").is_ok() {
+            2
+        } else {
+            60
+        };
+        glib::timeout_add_seconds_local(sleep_every, move || {
+            match sleep_weak.upgrade() {
+                Some(browser) => {
+                    browser.sleep_inactive_tabs();
+                    glib::ControlFlow::Continue
+                }
+                None => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    fn wire_toolbar(self: &Rc<Self>) {
+        let weak = self.this.clone();
+        self.back.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_back();
+            }
+        });
+        let weak = self.this.clone();
+        self.forward.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_forward();
+            }
+        });
+        let weak = self.this.clone();
+        self.reload_button.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.reload_active();
+            }
+        });
+        let weak = self.this.clone();
+        self.strip_back.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_back();
+            }
+        });
+        let weak = self.this.clone();
+        self.strip_forward.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_forward();
+            }
+        });
+        let weak = self.this.clone();
+        self.strip_reload.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.reload_active();
+            }
+        });
+        let weak = self.this.clone();
+        self.top_back.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_back();
+            }
+        });
+        let weak = self.this.clone();
+        self.top_forward.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_forward();
+            }
+        });
+        let weak = self.this.clone();
+        self.top_reload.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.reload_active();
+            }
+        });
+        let weak = self.this.clone();
+        self.top_address.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.open_omni();
+            }
+        });
+        let weak = self.this.clone();
+        self.address.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.open_omni();
+            }
+        });
+        let weak = self.this.clone();
+        self.sidebar_toggle.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.toggle_sidebar();
+            }
+        });
+        let weak = self.this.clone();
+        self.new_tab_button.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.new_tab(None, false);
+            }
+        });
+        let weak = self.this.clone();
+        self.ublock_button.connect_clicked(move |button| {
+            if let Some(browser) = weak.upgrade() {
+                browser.show_shield_menu(button);
+            }
+        });
+
+        let weak = self.this.clone();
+        self.ublock_side.connect_clicked(move |button| {
+            if let Some(browser) = weak.upgrade() {
+                browser.show_shield_menu(button);
+            }
+        });
+        let weak = self.this.clone();
+        self.bookmarks_button.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_internal("bookmarks");
+            }
+        });
+        let weak = self.this.clone();
+        self.downloads_button.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_internal("downloads");
+            }
+        });
+        let weak = self.this.clone();
+        self.side_bookmarks.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_internal("bookmarks");
+            }
+        });
+        let weak = self.this.clone();
+        self.side_downloads.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.go_internal("downloads");
+            }
+        });
+    }
+
+    fn wire_find(self: &Rc<Self>) {
+        let weak = self.this.clone();
+        self.find_entry.connect_changed(move |entry| {
+            if let Some(browser) = weak.upgrade() {
+                browser.find_search(entry.text().as_str(), false);
+            }
+        });
+        let weak = self.this.clone();
+        self.find_entry.connect_activate(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.find_next(false);
+            }
+        });
+        let weak = self.this.clone();
+        self.find_entry.connect_key_press_event(move |entry, event| {
+            let Some(browser) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            match event.keyval() {
+                gdk::keys::constants::Escape => {
+                    browser.close_find();
+                    glib::Propagation::Stop
+                }
+                gdk::keys::constants::Up => {
+                    browser.find_next(true);
+                    glib::Propagation::Stop
+                }
+                gdk::keys::constants::Down => {
+                    browser.find_next(false);
+                    glib::Propagation::Stop
+                }
+                _ => {
+                    let _ = entry;
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        let weak = self.this.clone();
+        if let Some(previous) = self.find_card.children().iter().find_map(|child| {
+            child
+                .downcast_ref::<gtk::Button>()
+                .filter(|button| button.tooltip_text().as_deref() == Some("Previous — Shift+Enter"))
+                .cloned()
+        }) {
+            previous.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.find_next(true);
+                }
+            });
+        }
+        let weak = self.this.clone();
+        if let Some(next) = self.find_card.children().iter().find_map(|child| {
+            child
+                .downcast_ref::<gtk::Button>()
+                .filter(|button| button.tooltip_text().as_deref() == Some("Next — Enter"))
+                .cloned()
+        }) {
+            next.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.find_next(false);
+                }
+            });
+        }
+        let weak = self.this.clone();
+        if let Some(close) = self.find_card.children().iter().find_map(|child| {
+            child
+                .downcast_ref::<gtk::Button>()
+                .filter(|button| button.tooltip_text().as_deref() == Some("Close — Esc"))
+                .cloned()
+        }) {
+            close.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.close_find();
+                }
+            });
+        }
+    }
+
+    fn wire_omni(self: &Rc<Self>) {
+        let weak = self.this.clone();
+        self.omni.layer.connect_button_press_event(move |_, _| {
+            if let Some(browser) = weak.upgrade() {
+                browser.close_omni();
+            }
+            glib::Propagation::Stop
+        });
+        let weak = self.this.clone();
+        self.omni.entry.connect_changed(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.refresh_suggestions();
+            }
+        });
+        let weak = self.this.clone();
+        self.omni.entry.connect_activate(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.submit_omni(false);
+            }
+        });
+        let weak = self.this.clone();
+        self.omni.entry.connect_key_press_event(move |_, event| {
+            let Some(browser) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            match event.keyval() {
+                gdk::keys::constants::Escape => {
+                    browser.close_omni();
+                    glib::Propagation::Stop
+                }
+                gdk::keys::constants::Up => {
+                    browser.move_omni_selection(-1);
+                    glib::Propagation::Stop
+                }
+                gdk::keys::constants::Down => {
+                    browser.move_omni_selection(1);
+                    glib::Propagation::Stop
+                }
+                gdk::keys::constants::Tab => {
+                    browser.move_omni_selection(1);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+
+    fn wire_toast(self: &Rc<Self>) {
+        let weak = self.this.clone();
+        self.toast_button.connect_clicked(move |_| {
+            let Some(browser) = weak.upgrade() else {
+                return;
+            };
+            browser.toast.hide();
+            let command = browser.toast_command.borrow_mut().take();
+            if let Some(command) = command {
+                match command {
+                    ToastCommand::SaveLogin => browser.save_pending_login(),
+                    ToastCommand::UndoVeil(host) => {
+                        browser.curtain.borrow_mut().undo(&host);
+                        browser.apply_veils_to_active();
+                        browser.toast("Put back");
+                        browser.reload_if_kind(&[PageKind::Hidden]);
+                    }
+                    ToastCommand::UblockResume(host) => {
+                        browser.prefs.borrow_mut().pause_shield(&host, false);
+                        browser.tune_all();
+                        browser.toast("uBlock filters are on");
+                        browser.reload_active();
+                    }
+                }
+            }
+        });
+    }
+
+    fn build_menu(self: &Rc<Self>, weak: &Weak<Browser>) {
+        let install = |button: &gtk::MenuButton| {
+            let (popover, content) = menu_popover();
+            add_menu_item(&content, &popover, "New Tab", "Ctrl+T", weak, Box::new(|b| b.new_tab(None, false)));
+            add_menu_item(&content, &popover, "New Private Tab", "Ctrl+Shift+N", weak, Box::new(|b| b.new_tab(None, true)));
+            content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+            add_menu_item(&content, &popover, "Split View", "Ctrl+Alt+N", weak, Box::new(|b| b.toggle_split()));
+            add_menu_item(&content, &popover, "Reading Mode", "Ctrl+Shift+R", weak, Box::new(|b| b.toggle_reader()));
+            add_menu_item(&content, &popover, "Hide Something…", "Ctrl+Shift+H", weak, Box::new(|b| b.start_veil_picker()));
+            add_menu_item(&content, &popover, "Find on Page…", "Ctrl+F", weak, Box::new(|b| b.open_find()));
+            content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+            add_menu_item(&content, &popover, "History", "Ctrl+H", weak, Box::new(|b| b.go_internal("history")));
+            add_menu_item(&content, &popover, "Bookmarks", "Ctrl+Shift+B", weak, Box::new(|b| b.go_internal("bookmarks")));
+            add_menu_item(&content, &popover, "Downloads", "Ctrl+J", weak, Box::new(|b| b.go_internal("downloads")));
+            add_menu_item(&content, &popover, "Passwords", "", weak, Box::new(|b| b.go_internal("passwords")));
+            content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+            add_menu_item(&content, &popover, "Zoom In", "Ctrl++", weak, Box::new(|b| b.zoom_by(0.1)));
+            add_menu_item(&content, &popover, "Zoom Out", "Ctrl+-", weak, Box::new(|b| b.zoom_by(-0.1)));
+            add_menu_item(&content, &popover, "Actual Size", "Ctrl+0", weak, Box::new(|b| b.zoom_reset()));
+            content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+            add_menu_item(&content, &popover, "Settings", "Ctrl+,", weak, Box::new(|b| b.go_internal("settings")));
+            add_menu_item(&content, &popover, "About Search", "", weak, Box::new(|b| b.go_internal("settings?tab=about")));
+            content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+            add_menu_item(&content, &popover, "Quit Search", "Ctrl+Q", weak, Box::new(|b| b.window.close()));
+            content.show_all();
+            button.set_popover(Some(&popover));
+        };
+        install(&self.menu_button);
+        install(&self.menu_side_button);
+    }
+
+    fn show_shield_menu(self: &Rc<Self>, relative: &gtk::Button) {
+        let popover = gtk::Popover::new(Some(relative));
+        popover.set_position(gtk::PositionType::Bottom);
+        popover.set_modal(true);
+        popover.style_context().add_class("menu-popover");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        content.set_size_request(248, -1);
+        content.set_margin_top(4);
+        content.set_margin_bottom(4);
+        content.set_margin_start(4);
+        content.set_margin_end(4);
+        popover.add(&content);
+
+        let prefs = self.prefs.borrow();
+        let enabled = prefs.adblock;
+        let host = self
+            .active_index()
+            .map(|index| store::bare_host(&self.tabs.borrow()[index].url))
+            .unwrap_or_default();
+        let paused = !host.is_empty() && prefs.shield_paused_on(&host);
+        drop(prefs);
+
+        let title = util::label(
+            if enabled { "uBlock filters are on" } else { "uBlock filters are off" },
+            Some("menu-label"),
+        );
+        title.set_margin_start(8);
+        title.set_margin_top(6);
+        title.set_margin_bottom(2);
+        content.pack_start(&title, false, false, 0);
+
+        let toggle = menu_row(if enabled { "Turn uBlock filters off" } else { "Turn uBlock filters on" }, "");
+        let popover_clone = popover.clone();
+        let weak = self.this.clone();
+        toggle.connect_clicked(move |_| {
+            popover_clone.popdown();
+            if let Some(browser) = weak.upgrade() {
+                let value = !browser.prefs.borrow().adblock;
+                browser.set_setting("adblock", serde_json::json!(value));
+            }
+        });
+        content.pack_start(&toggle, false, false, 0);
+
+        if !host.is_empty() {
+            let pause = menu_row(
+                if paused {
+                    format!("Turn uBlock filters back on for {}", host)
+                } else {
+                    format!("Pause uBlock filters on {}", host)
+                }
+                .as_str(),
+                "",
+            );
+            let popover_clone = popover.clone();
+            let weak = self.this.clone();
+            let host_owned = host.clone();
+            pause.connect_clicked(move |_| {
+                popover_clone.popdown();
+                if let Some(browser) = weak.upgrade() {
+                    browser.prefs.borrow_mut().pause_shield(&host_owned, !paused);
+                    browser.tune_all();
+                    browser.reload_active();
+                    browser.toast(if paused { "uBlock filters are on" } else { "uBlock filters paused here" });
+                }
+            });
+            content.pack_start(&pause, false, false, 0);
+        }
+        content.show_all();
+        popover.popup();
+    }
+
+    fn wire_shortcuts(self: &Rc<Self>, weak: &Weak<Browser>) {
+        let app = &self.app;
+        add_app_action(app, weak, "new-tab", &["<Primary>t"], Box::new(|b| b.new_tab_from_active()));
+        add_app_action(app, weak, "new-private", &["<Primary><Shift>n"], Box::new(|b| b.new_tab(None, true)));
+        add_app_action(app, weak, "close-tab", &["<Primary>w", "<Primary>BackSpace"], Box::new(|b| b.close_active_tab()));
+        add_app_action(app, weak, "undo-close", &["<Primary><Shift>t"], Box::new(|b| b.undo_close()));
+        add_app_action(
+            app,
+            weak,
+            "focus-address",
+            &["<Primary>l"],
+            Box::new(|b| b.open_omni()),
+        );
+        add_app_action(app, weak, "list-tabs", &["<Primary>k"], Box::new(|b| b.list_tabs()));
+        add_app_action(app, weak, "reload", &["<Primary>r"], Box::new(|b| b.reload_active()));
+        add_app_action(app, weak, "find", &["<Primary>f"], Box::new(|b| b.open_find()));
+        add_app_action(
+            app,
+            weak,
+            "reader",
+            &["<Primary><Shift>r"],
+            Box::new(|b| b.toggle_reader()),
+        );
+        add_app_action(
+            app,
+            weak,
+            "hide-element",
+            &["<Primary><Shift>h"],
+            Box::new(|b| b.start_veil_picker()),
+        );
+        add_app_action(
+            app,
+            weak,
+            "toggle-sidebar",
+            &["<Primary><Shift>s"],
+            Box::new(|b| b.toggle_sidebar()),
+        );
+        add_app_action(app, weak, "fold-sidebar", &["<Primary>s"], Box::new(|b| b.toggle_sidebar()));
+        add_app_action(app, weak, "next-tab", &["<Primary>Tab"], Box::new(|b| b.cycle_tab(1)));
+        add_app_action(
+            app,
+            weak,
+            "prev-tab",
+            &["<Primary><Shift>Tab"],
+            Box::new(|b| b.cycle_tab(-1)),
+        );
+        add_app_action(app, weak, "zoom-in", &["<Primary>plus", "<Primary>equal"], Box::new(|b| b.zoom_by(0.1)));
+        add_app_action(app, weak, "zoom-out", &["<Primary>minus"], Box::new(|b| b.zoom_by(-0.1)));
+        add_app_action(app, weak, "zoom-reset", &["<Primary>0"], Box::new(|b| b.zoom_reset()));
+        add_app_action(
+            app,
+            weak,
+            "split",
+            &["<Primary><Alt>n"],
+            Box::new(|b| b.toggle_split()),
+        );
+        add_app_action(app, weak, "bookmarks", &["<Primary><Shift>b"], Box::new(|b| b.go_internal("bookmarks")));
+        add_app_action(app, weak, "history", &["<Primary>h"], Box::new(|b| b.go_internal("history")));
+        add_app_action(app, weak, "downloads", &["<Primary>j"], Box::new(|b| b.go_internal("downloads")));
+        add_app_action(app, weak, "settings", &["<Primary>comma"], Box::new(|b| b.go_internal("settings")));
+        add_app_action(app, weak, "back", &["<Alt>Left"], Box::new(|b| b.go_back()));
+        add_app_action(app, weak, "forward", &["<Alt>Right"], Box::new(|b| b.go_forward()));
+        add_app_action(app, weak, "quit", &["<Primary>q"], Box::new(|b| b.window.close()));
+        for number in 1..=9u32 {
+            let name = format!("tab-{}", number);
+            let accel = format!("<Primary>{}", number);
+            add_app_action(
+                app,
+                weak,
+                &name,
+                &[accel.as_str()],
+                Box::new(move |b| b.tab_by_number(number)),
+            );
+        }
+    }
+
+    pub fn start(self: &Rc<Self>, urls: Vec<String>) {
+        self.loading_session.set(true);
+        let mut active_id: Option<u64> = None;
+        let shape = if self.prefs.borrow().restore_session {
+            store::read_session()
+        } else {
+            SessionShape::default()
+        };
+        let start_fresh = self.prefs.borrow().start_fresh;
+        for (index, entry) in shape.tabs.iter().enumerate() {
+            if entry.url.is_empty() || entry.url == "about:blank" {
+                continue;
+            }
+            if start_fresh && entry.pin.is_none() && entry.name.is_none() {
+                continue;
+            }
+            let (position, _) = self.add_tab(
+                None,
+                false,
+                false,
+                entry.pin.as_deref(),
+                entry.name.as_deref(),
+                entry.home.as_deref(),
+                entry.muted,
+            );
+            {
+                let mut tabs = self.tabs.borrow_mut();
+                if let Some(tab) = tabs.get_mut(position) {
+                    tab.url = entry.url.clone();
+                    tab.title = entry.title.clone();
+                    tab.kind = kind_for(&entry.url);
+                    // Restored pages wait for their first visit. Creating
+                    // every WebView but not loading it keeps the tab bar
+                    // exactly as it was without paying for a web process per
+                    // saved tab at launch.
+                    tab.suspended = true;
+                    tab.last_used = Instant::now();
+                }
+            }
+            if index == shape.active.max(0) as usize {
+                active_id = self.tabs.borrow().get(position).map(|tab| tab.id);
+            }
+        }
+        self.loading_session.set(false);
+
+        if !urls.is_empty() {
+            let mut last = None;
+            for url in urls {
+                let (_, view) = self.add_tab(Some(&url), false, true, None, None, None, false);
+                last = Some(view);
+            }
+            let _ = last;
+        } else if self.tabs.borrow().is_empty() {
+            let welcomed = self.prefs.borrow().has_welcomed;
+            let welcomes = self.prefs.borrow().welcomes;
+            if !welcomed && welcomes {
+                self.add_tab(Some("search://welcome"), false, true, None, None, None, false);
+            } else {
+                self.add_tab(Some("search://blank"), false, true, None, None, None, false);
+            }
+        } else if let Some(id) = active_id {
+            self.switch_to_id(id);
+        } else {
+            self.switch_to(0);
+        }
+
+        self.apply_layout();
+        self.apply_look();
+        self.rebuild_bookmarks_bar();
+        self.strip_wrap.set_visible(true);
+        let prefs = self.prefs.borrow();
+        self.bookmarks_bar
+            .set_visible(prefs.bookmarks_bar && !prefs.static_bookmarks);
+        drop(prefs);
+        self.find_card.hide();
+        self.link_hint.hide();
+        self.omni.layer.hide();
+        self.omni.card.hide();
+        self.toast.hide();
+        self.window.show_all();
+        self.window.present();
+        // Some views never send motion through the page script; a slow
+        // seat check keeps the edge bars honest over those too.
+        let watch_weak = self.this.clone();
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            match watch_weak.upgrade() {
+                Some(browser) => {
+                    browser.watch_pointer();
+                    glib::ControlFlow::Continue
+                }
+                None => glib::ControlFlow::Break,
+            }
+        });
+        self.apply_layout();
+        self.find_card.hide();
+        self.link_hint.hide();
+        self.omni.layer.hide();
+        self.omni.card.hide();
+        self.toast.hide();
+        let open_omni_on_start = self.active_index().map(|index| {
+            let url = self.tabs.borrow()[index].url.clone();
+            url.is_empty() || url == "about:blank" || url == "search://blank"
+        }).unwrap_or(false);
+        if open_omni_on_start {
+            let weak = self.this.clone();
+            glib::idle_add_local(move || {
+                if let Some(browser) = weak.upgrade() {
+                    browser.open_omni();
+                }
+                glib::ControlFlow::Break
+            });
+        } else if let Some(view) = self.active_view() {
+            view.grab_focus();
+        }
+    }
+}
+
+// -------------------------------------------------------------------- tabs
+
+impl Browser {
+    fn create_view(self: &Rc<Self>, id: u64, private: bool) -> (WebView, UserContentManager) {
+        let manager = UserContentManager::new();
+        manager.register_script_message_handler("search");
+        let weak = self.this.clone();
+        manager.connect_script_message_received(Some("search"), move |_manager, result| {
+            if let Some(browser) = weak.upgrade() {
+                if let Some(value) = result.js_value() {
+                    let text = value.to_str().to_string();
+                    if !text.is_empty() {
+                        browser.handle_message(id, &text);
+                    }
+                }
+            }
+        });
+        let script = UserScript::new(
+            PASSWORD_SCRIPT,
+            UserContentInjectedFrames::TopFrame,
+            UserScriptInjectionTime::End,
+            &[],
+            &[],
+        );
+        manager.add_script(&script);
+        let pointer_script = UserScript::new(
+            POINTER_SCRIPT,
+            UserContentInjectedFrames::TopFrame,
+            UserScriptInjectionTime::End,
+            &[],
+            &[],
+        );
+        manager.add_script(&pointer_script);
+        // YouTube's ad instructions travel inside its own player JSON, out
+        // of reach of the content blocker. This starts before any page
+        // script so it sees the very first assignment, in every frame, but
+        // it returns immediately on every other site.
+        let youtube_script = UserScript::new(
+            YOUTUBE_SCRIPT,
+            UserContentInjectedFrames::AllFrames,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        manager.add_script(&youtube_script);
+
+        let view = WebView::builder()
+            .web_context(if private {
+                &self.private_context
+            } else {
+                &self.context
+            })
+            .user_content_manager(&manager)
+            .build();
+
+        let settings = webkit2gtk::Settings::new();
+        settings.set_enable_javascript(true);
+        settings.set_enable_webgl(true);
+        settings.set_enable_media_stream(true);
+        settings.set_enable_mediasource(true);
+        settings.set_enable_encrypted_media(true);
+        settings.set_enable_page_cache(true);
+        settings.set_enable_smooth_scrolling(true);
+        {
+            let prefs = self.prefs.borrow();
+            settings.set_enable_developer_extras(prefs.developer_extras);
+            settings.set_media_playback_requires_user_gesture(prefs.waits_for_play);
+        }
+        settings.set_javascript_can_open_windows_automatically(false);
+        view.set_settings(&settings);
+        view.set_zoom_level(self.prefs.borrow().page_zoom);
+        view.set_background_color(&self.page_background());
+
+        let weak = self.this.clone();
+        view.connect_load_changed(move |_view, event| {
+            if let Some(browser) = weak.upgrade() {
+                browser.on_load(id, event);
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_uri_notify(move |_view| {
+            if let Some(browser) = weak.upgrade() {
+                browser.on_uri(id);
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_title_notify(move |_view| {
+            if let Some(browser) = weak.upgrade() {
+                browser.on_title(id);
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_favicon_notify(move |_view| {
+            if let Some(browser) = weak.upgrade() {
+                browser.on_favicon(id);
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_is_loading_notify(move |_view| {
+            if let Some(browser) = weak.upgrade() {
+                browser.refresh_header();
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_mouse_target_changed(move |_view, hit, _modifiers| {
+            if let Some(browser) = weak.upgrade() {
+                browser.on_hover(id, hit.link_uri().map(|u| u.to_string()));
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_load_failed(move |_view, _event, uri, error| {
+            if let Some(browser) = weak.upgrade() {
+                return browser.on_load_failed(id, uri, error);
+            }
+            true
+        });
+        let weak = self.this.clone();
+        view.connect_create(move |_view, action| {
+            let browser = weak.upgrade()?;
+            browser.on_create(id, action)
+        });
+        let weak = self.this.clone();
+        view.connect_web_process_terminated(move |_view, _reason| {
+            if let Some(browser) = weak.upgrade() {
+                let sleeping = browser
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .map(|tab| tab.suspended)
+                    .unwrap_or(true);
+                if !sleeping {
+                    browser.toast("This page stopped responding");
+                }
+            }
+        });
+        let weak = self.this.clone();
+        view.connect_decide_policy(move |_view, decision, decision_type| {
+            match weak.upgrade() {
+                Some(browser) => browser.on_decide(id, decision, decision_type),
+                None => false,
+            }
+        });
+
+        if let Some(controller) = view.find_controller() {
+            let weak = self.this.clone();
+            controller.connect_found_text(move |_controller, count| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.on_found(id, Some(count));
+                }
+            });
+            let weak = self.this.clone();
+            controller.connect_failed_to_find_text(move |_controller| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.on_found(id, None);
+                }
+            });
+        }
+
+        (view, manager)
+    }
+
+    fn add_tab(
+        self: &Rc<Self>,
+        url: Option<&str>,
+        private: bool,
+        activate: bool,
+        pin: Option<&str>,
+        name: Option<&str>,
+        home: Option<&str>,
+        muted: bool,
+    ) -> (usize, WebView) {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let (view, manager) = self.create_view(id, private);
+        let target = url.map(|value| value.to_string()).unwrap_or_default();
+        let kind = if target.is_empty() {
+            PageKind::Blank
+        } else {
+            kind_for(&target)
+        };
+        let title = kind.title().to_string();
+        let tab = Tab {
+            id,
+            view: view.clone(),
+            manager,
+            kind,
+            title,
+            url: target.clone(),
+            pin: pin.map(|value| value.to_string()),
+            name: name.map(|value| value.to_string()),
+            home: home.map(|value| value.to_string()),
+            muted,
+            reader: false,
+            private,
+            suspended: false,
+            last_used: Instant::now(),
+            filtered: false,
+            retried: Cell::new(false),
+            retrying: Cell::new(false),
+            favicon: None,
+        };
+        view.set_is_muted(muted);
+
+        let place = self.prefs.borrow().new_tab_place;
+        let current = self.active.get();
+        let length = self.tabs.borrow().len();
+        let position = if length == 0 {
+            0
+        } else {
+            match place {
+                0 => (current + 1).min(length),
+                2 => 0,
+                _ => length,
+            }
+        };
+        if !activate && position <= current && length > 0 {
+            self.active.set(current + 1);
+        }
+        self.tabs.borrow_mut().insert(position, tab);
+        self.stack.add_named(&view, &id.to_string());
+        view.show();
+
+        if !target.is_empty() && target != "about:blank" {
+            self.tune_for_id(position, &target);
+            if self.may_load(kind) {
+                view.load_uri(&target);
+            } else {
+                // uBlock is still compiling or loading. Keep the address and
+                // let the page wait for the filter instead of fetching ads
+                // unfiltered on the opening view.
+                self.tabs.borrow_mut()[position].suspended = true;
+            }
+        } else if !target.is_empty() {
+            view.load_uri("search://blank");
+        }
+
+        if activate {
+            self.switch_to(position);
+        } else {
+            self.rebuild_tabs();
+            self.refresh_header();
+            self.save_session();
+        }
+        (position, view)
+    }
+
+    fn new_tab(self: &Rc<Self>, url: Option<&str>, private: bool) {
+        self.close_omni();
+        let blank = url.map(|u| u.trim().is_empty() || u == "about:blank").unwrap_or(true);
+        self.add_tab(url, private, true, None, None, None, false);
+        if blank {
+            let weak = self.this.clone();
+            glib::idle_add_local(move || {
+                if let Some(browser) = weak.upgrade() {
+                    browser.open_omni();
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    }
+
+    // Ctrl+T from a private tab opens another private tab, so a private
+    // search never lands in the shared session or history.
+    fn new_tab_from_active(self: &Rc<Self>) {
+        let private = self
+            .active_index()
+            .map(|index| self.tabs.borrow()[index].private)
+            .unwrap_or(false);
+        self.new_tab(None, private);
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.tabs.borrow().iter().position(|tab| tab.id == id)
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        let length = self.tabs.borrow().len();
+        if length == 0 {
+            None
+        } else {
+            Some(self.active.get().min(length - 1))
+        }
+    }
+
+    pub fn active_view(&self) -> Option<WebView> {
+        self.active_index()
+            .map(|index| self.tabs.borrow()[index].view.clone())
+    }
+
+    fn active_host(&self) -> String {
+        self.active_index()
+            .map(|index| store::bare_host(&self.tabs.borrow()[index].url))
+            .unwrap_or_default()
+    }
+
+    fn switch_to_id(self: &Rc<Self>, id: u64) {
+        if let Some(index) = self.index_of(id) {
+            self.switch_to(index);
+        }
+    }
+
+    fn switch_to(self: &Rc<Self>, index: usize) {
+        let length = self.tabs.borrow().len();
+        if length == 0 {
+            return;
+        }
+        let index = index.min(length - 1);
+        let (id, view, pin, home, suspended, kind, url) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (
+                tab.id,
+                tab.view.clone(),
+                tab.pin.clone(),
+                tab.home.clone(),
+                tab.suspended,
+                tab.kind,
+                tab.url.clone(),
+            )
+        };
+        if self.split_second.get() == Some(id) {
+            self.unsplit();
+        }
+        self.active.set(index);
+        self.stack.set_visible_child_name(&id.to_string());
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            if let Some(tab) = tabs.get_mut(index) {
+                tab.last_used = Instant::now();
+            }
+        }
+        let want_home = pin.is_some()
+            && home
+                .as_deref()
+                .map(|value| !value.is_empty() && value != url)
+                .unwrap_or(false);
+        let target = if want_home {
+            home.clone().unwrap_or_else(|| url.clone())
+        } else {
+            url.clone()
+        };
+        if suspended && self.may_load(kind) {
+            self.load_page(index, &target);
+        } else if want_home && self.may_load(kind) {
+            view.load_uri(&target);
+        }
+        self.refresh_header();
+        self.rebuild_tabs();
+        self.save_session();
+        view.grab_focus();
+    }
+
+    fn close_active_tab(self: &Rc<Self>) {
+        if let Some(index) = self.active_index() {
+            self.close_tab(index);
+        }
+    }
+
+    fn close_tab_id(self: &Rc<Self>, id: u64) {
+        if let Some(index) = self.index_of(id) {
+            self.close_tab(index);
+        }
+    }
+
+    fn close_tab(self: &Rc<Self>, index: usize) {
+        if index >= self.tabs.borrow().len() {
+            return;
+        }
+        let id = self.tabs.borrow()[index].id;
+        if self.split_second.get() == Some(id) {
+            self.unsplit();
+        }
+        let mut tab = self.tabs.borrow_mut().remove(index);
+        self.last_closed.borrow_mut().push(SessionTab {
+            url: tab.url.clone(),
+            title: tab.display_title(),
+            pin: tab.pin.clone(),
+            name: tab.name.clone(),
+            home: tab.home.clone(),
+            muted: tab.muted,
+        });
+        tab.view.stop_loading();
+        // Closing a tab should give its web process back now instead of
+        // leaving it in WebKit's spare pool.
+        tab.suspended = true;
+        tab.view.terminate_web_process();
+        self.stack.remove(&tab.view);
+        let length = self.tabs.borrow().len();
+        if length == 0 {
+            self.active.set(0);
+            self.new_tab(None, false);
+            return;
+        }
+        let was_active = self.active.get();
+        let next = if index < was_active {
+            was_active - 1
+        } else {
+            was_active
+        }
+        .min(length - 1);
+        self.active.set(next);
+        self.switch_to(next);
+    }
+
+    fn undo_close(self: &Rc<Self>) {
+        let entry = self.last_closed.borrow_mut().pop();
+        let Some(entry) = entry else {
+            self.toast("Nothing to reopen");
+            return;
+        };
+        let (position, _) = self.add_tab(
+            Some(&entry.url),
+            false,
+            true,
+            entry.pin.as_deref(),
+            entry.name.as_deref(),
+            entry.home.as_deref(),
+            entry.muted,
+        );
+        let _ = position;
+    }
+
+    fn cycle_tab(self: &Rc<Self>, delta: i32) {
+        let length = self.tabs.borrow().len();
+        if length == 0 {
+            return;
+        }
+        let current = self.active.get() as i32;
+        let next = (current + delta).rem_euclid(length as i32) as usize;
+        self.switch_to(next);
+    }
+
+    fn tab_by_number(self: &Rc<Self>, number: u32) {
+        let index = number.saturating_sub(1) as usize;
+        if index < self.tabs.borrow().len() {
+            self.switch_to(index);
+        }
+    }
+
+    fn go_back(self: &Rc<Self>) {
+        if let Some(index) = self.active_index() {
+            let tabs = self.tabs.borrow_mut();
+            tabs[index].retried.set(false);
+            tabs[index].retrying.set(false);
+        }
+        if let Some(view) = self.active_view() {
+            if view.can_go_back() {
+                view.go_back();
+            }
+        }
+    }
+
+    fn go_forward(self: &Rc<Self>) {
+        if let Some(index) = self.active_index() {
+            let tabs = self.tabs.borrow_mut();
+            tabs[index].retried.set(false);
+            tabs[index].retrying.set(false);
+        }
+        if let Some(view) = self.active_view() {
+            if view.can_go_forward() {
+                view.go_forward();
+            }
+        }
+    }
+
+    fn reload_active(self: &Rc<Self>) {
+        if let Some(index) = self.active_index() {
+            {
+                let mut tabs = self.tabs.borrow_mut();
+                tabs[index].reader = false;
+                tabs[index].retried.set(false);
+                tabs[index].retrying.set(false);
+            }
+            let view = self.tabs.borrow()[index].view.clone();
+            view.reload();
+        }
+    }
+
+    fn navigate(self: &Rc<Self>, url: &str) {
+        self.close_omni();
+        if let Some(index) = self.active_index() {
+            self.navigate_in(index, url);
+        } else {
+            self.add_tab(Some(url), false, true, None, None, None, false);
+        }
+    }
+
+    fn navigate_in(self: &Rc<Self>, index: usize, url: &str) {
+        if index >= self.tabs.borrow().len() {
+            return;
+        }
+        let target = if url.trim().is_empty() {
+            "search://blank".to_string()
+        } else {
+            url.trim().to_string()
+        };
+        let view = {
+            let mut tabs = self.tabs.borrow_mut();
+            let tab = &mut tabs[index];
+            tab.kind = kind_for(&target);
+            tab.url = target.clone();
+            tab.reader = false;
+            tab.retried.set(false);
+            tab.retrying.set(false);
+            tab.view.clone()
+        };
+        self.tune_for_id(index, &target);
+        if self.may_load(self.tabs.borrow()[index].kind) {
+            view.load_uri(&target);
+        } else {
+            // The lists are still loading. Remember the address and open it
+            // as soon as the filter is ready, so nothing slips past it.
+            self.tabs.borrow_mut()[index].suspended = true;
+        }
+        if self.active.get() == index {
+            self.refresh_header();
+        }
+        self.save_session();
+    }
+
+    fn go_typed(self: &Rc<Self>, text: &str, alternate: bool) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if !alternate {
+            if let Some(url) = self.instant_place(text) {
+                self.navigate(&url);
+                return;
+            }
+            if store::looks_like_url(text) {
+                if let Some(url) = store::url_from_typed(text) {
+                    self.navigate(url.as_str());
+                    return;
+                }
+            }
+        }
+        let (engine, custom) = {
+            let prefs = self.prefs.borrow();
+            if alternate && !prefs.shift_engine.is_empty() {
+                (prefs.shift_engine.clone(), prefs.shift_custom.clone())
+            } else {
+                (prefs.engine.clone(), prefs.custom_engine.clone())
+            }
+        };
+        if let Some(url) = store::engine_url(&engine, &custom, text) {
+            self.navigate(&url);
+        }
+    }
+
+    fn instant_place(&self, text: &str) -> Option<String> {
+        match text.to_lowercase().as_str() {
+            "settings" => Some("search://settings".into()),
+            "history" => Some("search://history".into()),
+            "bookmarks" => Some("search://bookmarks".into()),
+            "downloads" => Some("search://downloads".into()),
+            "passwords" => Some("search://passwords".into()),
+            "hidden" => Some("search://hidden".into()),
+            _ => {
+                if text.starts_with("search://") {
+                    Some(text.to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn on_create(self: &Rc<Self>, opener: u64, action: &NavigationAction) -> Option<gtk::Widget> {
+        // Block popup windows not initiated by a user gesture.
+        if !action.is_user_gesture() {
+            return None;
+        }
+        let private = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.id == opener)
+            .map(|tab| tab.private)
+            .unwrap_or(false);
+        let (_, view) = self.add_tab(None, private, true, None, None, None, false);
+        Some(view.upcast())
+    }
+
+    fn on_decide(
+        self: &Rc<Self>,
+        id: u64,
+        decision: &PolicyDecision,
+        decision_type: PolicyDecisionType,
+    ) -> bool {
+        if decision_type != PolicyDecisionType::NavigationAction {
+            return false;
+        }
+        let Some(navigation) = decision
+            .clone()
+            .downcast::<NavigationPolicyDecision>()
+            .ok()
+        else {
+            return false;
+        };
+        let Some(request) = navigation.request() else {
+            return false;
+        };
+        let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+        let scheme = uri.split(':').next().unwrap_or("").to_lowercase();
+        let allowed = matches!(
+            scheme.as_str(),
+            "http" | "https" | "file" | "search" | "about" | "data" | "blob" | "view-source"
+        );
+        if !allowed {
+            decision.ignore();
+            if scheme == "mailto" || scheme == "tel" {
+                let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+            } else if !scheme.is_empty() {
+                self.toast(&format!("Search doesn't know how to open {} links", scheme));
+            }
+            return true;
+        }
+        if let Some(index) = self.index_of(id) {
+            self.tune_for_id(index, &uri);
+        }
+        let _ = navigation.navigation_type();
+        let _ = NavigationType::Other;
+        false
+    }
+
+    fn on_uri(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        // Terminating a web process (a sleeping tab) makes WebKit notify an
+        // empty URI. Ignore it, or the tab would forget the page it was on
+        // and wake up blank.
+        let Some(url) = self.tabs.borrow()[index]
+            .view
+            .uri()
+            .map(|u| u.to_string())
+            .filter(|u| !u.is_empty())
+        else {
+            return;
+        };
+        let kind = kind_for(&url);
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            tabs[index].url = url;
+            tabs[index].kind = kind;
+        }
+        if self.active.get() == index {
+            self.refresh_header();
+        }
+    }
+
+    fn on_title(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let title = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            let view_title = tab.view.title().map(|t| t.to_string()).unwrap_or_default();
+            if tab.kind.internal() && view_title.trim().is_empty() {
+                tab.kind.title().to_string()
+            } else {
+                view_title
+            }
+        };
+        if title.trim().is_empty() {
+            return;
+        }
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            // Many pages announce their title more than once; rebuilding the
+            // whole tab strip for an identical string only costs frames.
+            if tabs[index].title == title {
+                return;
+            }
+            tabs[index].title = title;
+        }
+        self.rebuild_tabs();
+        if self.active.get() == index {
+            self.refresh_header();
+        }
+    }
+
+    fn on_favicon(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let Some(surface) = self.tabs.borrow()[index].view.favicon() else {
+            return;
+        };
+        let Ok(image) = surface.map_to_image(None) else {
+            return;
+        };
+        let (width, height) = (image.width(), image.height());
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let Some(pixbuf) = gdk::pixbuf_get_from_surface(&surface, 0, 0, width, height) else {
+            return;
+        };
+        let scaled = pixbuf.scale_simple(16, 16, gdk_pixbuf::InterpType::Bilinear);
+        if let Some(pixbuf) = scaled {
+            self.tabs.borrow_mut()[index].favicon = Some(pixbuf);
+            if self.prefs.borrow().glyph == "icons" {
+                self.rebuild_tabs();
+            }
+        }
+    }
+
+    fn on_load(self: &Rc<Self>, id: u64, event: LoadEvent) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        // A process that is being terminated for sleep may still report a
+        // finished load with an empty URI. Leave the saved page alone.
+        if self.tabs.borrow()[index].suspended {
+            return;
+        }
+        match event {
+            LoadEvent::Started => {
+                // A fresh navigation gets a fresh retry. The retry's own
+                // Started event must keep the spent flag, or every failure
+                // would start another retry forever.
+                let tabs = self.tabs.borrow_mut();
+                if tabs[index].retrying.get() {
+                    tabs[index].retrying.set(false);
+                } else {
+                    tabs[index].retried.set(false);
+                }
+            }
+            LoadEvent::Committed => {
+                let (url, kind) = {
+                    let tabs = self.tabs.borrow();
+                    let tab = &tabs[index];
+                    let url = tab
+                        .view
+                        .uri()
+                        .map(|u| u.to_string())
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| tab.url.clone());
+                    (url.clone(), kind_for(&url))
+                };
+                {
+                    let mut tabs = self.tabs.borrow_mut();
+                    tabs[index].url = url.clone();
+                    tabs[index].kind = kind;
+                }
+                self.tune_for_id(index, &url);
+                if self.active.get() == index {
+                    self.refresh_header();
+                }
+            }
+            LoadEvent::Finished => {
+                let (url, title, kind, private) = {
+                    let tabs = self.tabs.borrow();
+                    let tab = &tabs[index];
+                    let url = tab
+                        .view
+                        .uri()
+                        .map(|u| u.to_string())
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| tab.url.clone());
+                    let title = tab.view.title().map(|t| t.to_string()).unwrap_or_default();
+                    let kind = kind_for(&url);
+                    let private = tab.private;
+                    (url, title, kind, private)
+                };
+                {
+                    let mut tabs = self.tabs.borrow_mut();
+                    let tab = &mut tabs[index];
+                    tab.url = url.clone();
+                    tab.kind = kind;
+                    if !title.trim().is_empty() {
+                        tab.title = title.clone();
+                    }
+                    tab.reader = false;
+                    if self.active.get() == index {
+                        tab.last_used = Instant::now();
+                    }
+                }
+                if !private && kind == PageKind::Web && !url.is_empty() {
+                    *self.last_host.borrow_mut() = store::bare_host(&url);
+                    let history_title = if title.trim().is_empty() {
+                        store::pretty_url(&url)
+                    } else {
+                        title
+                    };
+                    self.history.borrow_mut().visit(&url, &history_title);
+                } else if kind == PageKind::Web && !url.is_empty() {
+                    *self.last_host.borrow_mut() = store::bare_host(&url);
+                }
+                self.apply_page_scripts(index);
+                self.apply_pending_fill(index);
+                self.rebuild_tabs();
+                self.refresh_header();
+                self.save_session();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_load_failed(self: &Rc<Self>, id: u64, uri: &str, error: &glib::Error) -> bool {
+        // Errors from a process we just put to sleep, or from a tab that has
+        // already been replaced, are not failures the reader needs to see.
+        let Some(index) = self.index_of(id) else {
+            return true;
+        };
+        if self.tabs.borrow()[index].suspended {
+            return true;
+        }
+        let kind = error.kind::<NetworkError>();
+        // Cancelled is what a redirect, a stop, or a navigation replaced by
+        // a newer one reports. Showing an error page here was the reason
+        // pages sometimes appeared to fail on the first try.
+        if kind == Some(NetworkError::Cancelled) {
+            return true;
+        }
+        // A failed address almost always clears on a second attempt: the
+        // network process may still be starting, a name may not have
+        // resolved yet, or a connection may have been refused once. Only
+        // kinds a retry cannot possibly fix are excluded. Spend that one
+        // retry before drawing an error page.
+        let permanent = matches!(
+            kind,
+            Some(NetworkError::UnknownProtocol) | Some(NetworkError::FileDoesNotExist)
+        );
+        let web = uri.starts_with("http://") || uri.starts_with("https://");
+        if web && !permanent && !self.tabs.borrow()[index].retried.get() {
+            self.tabs.borrow_mut()[index].retried.set(true);
+            eprintln!("Search: retrying {} after {}", uri, error.message());
+            let weak = self.this.clone();
+            let target = uri.to_string();
+            glib::timeout_add_local_once(Duration::from_millis(350), move || {
+                let Some(browser) = weak.upgrade() else {
+                    return;
+                };
+                let Some(index) = browser.index_of(id) else {
+                    return;
+                };
+                if browser.tabs.borrow()[index].suspended {
+                    return;
+                }
+                // The reader may have typed something else while the retry
+                // was waiting; never pull them back to the failed address.
+                if browser.tabs.borrow()[index].url != target {
+                    return;
+                }
+                let view = browser.tabs.borrow()[index].view.clone();
+                browser.tabs.borrow_mut()[index].retrying.set(true);
+                view.load_uri(&target);
+            });
+            return true;
+        }
+        eprintln!("Search: could not load {}: {}", uri, error.message());
+        let host = store::bare_host(uri);
+        let inside = if host.is_empty() {
+            uri.to_string()
+        } else {
+            host.clone()
+        };
+        let html = format!(
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Couldn't open</title>
+<style>html,body{{margin:0;height:100%;background:#fff;color:#1b1b1b;font:14px/1.55 Cantarell,Inter,sans-serif}}main{{max-width:520px;margin:16vh auto;padding:0 26px}}h1{{font-size:26px;letter-spacing:-.02em;margin:0 0 10px}}p{{color:#6d6d6d}}button{{margin-top:18px;border:1px solid #ddd;background:#fff;border-radius:8px;padding:8px 15px;font:inherit;cursor:pointer}}</style></head>
+<body><main><h1>Couldn't open that page</h1><p>{}<br>{}</p><button onclick="location.reload()">Try Again</button></main></body></html>"#,
+            store::html_escape(&inside),
+            store::html_escape(error.message())
+        );
+        let view = self.tabs.borrow()[index].view.clone();
+        view.load_alternate_html(&html, uri, None);
+        self.toast(&format!("Couldn't open {}", inside));
+        // Handled: returning false here used to let WebKit draw its own
+        // error page on top of this one, which often won the race.
+        true
+    }
+
+    fn page_background(&self) -> gdk::RGBA {
+        let dark = self.prefers_dark();
+        gdk::RGBA::parse(if dark { "#1c1c1c" } else { "#ffffff" })
+            .unwrap_or_else(|_| gdk::RGBA::new(1.0, 1.0, 1.0, 1.0))
+    }
+
+    fn save_session(&self) {
+        if self.loading_session.get() {
+            return;
+        }
+        if let Some(source) = self.session_save_source.borrow_mut().take() {
+            source.remove();
+        }
+        let Some(browser) = self.this.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(&browser);
+        let source = glib::timeout_add_seconds_local(2, move || {
+            if let Some(browser) = weak.upgrade() {
+                browser.session_save_source.borrow_mut().take();
+                browser.flush_session();
+            }
+            glib::ControlFlow::Break
+        });
+        *self.session_save_source.borrow_mut() = Some(source);
+    }
+
+    fn flush_session(&self) {
+        if self.loading_session.get() {
+            return;
+        }
+        if let Some(source) = self.session_save_source.borrow_mut().take() {
+            source.remove();
+        }
+        let tabs = self.tabs.borrow();
+        let mut entries = Vec::new();
+        let mut active = 0i32;
+        let active_index = self.active.get();
+        for (index, tab) in tabs.iter().enumerate() {
+            if tab.private {
+                continue;
+            }
+            if index == active_index {
+                active = entries.len() as i32;
+            }
+            entries.push(SessionTab {
+                url: tab.url.clone(),
+                title: tab.display_title(),
+                pin: tab.pin.clone(),
+                name: tab.name.clone(),
+                home: tab.home.clone(),
+                muted: tab.muted,
+            });
+        }
+        drop(tabs);
+        let shape = SessionShape {
+            tabs: entries,
+            active,
+            splits: Vec::new(),
+        };
+        store::write_session(&shape);
+    }
+
+    fn on_hover(self: &Rc<Self>, id: u64, link: Option<String>) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        if index != self.active.get() {
+            return;
+        }
+        if !self.prefs.borrow().show_links {
+            self.link_hint.hide();
+            return;
+        }
+        match link {
+            Some(uri) if !uri.is_empty() => {
+                self.link_hint.set_text(&store::pretty_url(&uri));
+                self.link_hint.show();
+            }
+            _ => self.link_hint.hide(),
+        }
+    }
+
+    fn on_found(self: &Rc<Self>, id: u64, count: Option<u32>) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        if index != self.active.get() {
+            return;
+        }
+        match count {
+            Some(0) | None => self.find_status.set_text("No matches"),
+            Some(1) => self.find_status.set_text("1 match"),
+            Some(count) => self.find_status.set_text(&format!("{} matches", count)),
+        }
+    }
+
+    fn refresh_header(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (title, url, kind, loading, can_back, can_forward, pinned, muted) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (
+                tab.display_title(),
+                tab.url.clone(),
+                tab.kind,
+                tab.view.is_loading(),
+                tab.view.can_go_back(),
+                tab.view.can_go_forward(),
+                tab.pin.is_some(),
+                tab.muted,
+            )
+        };
+        let label = if kind == PageKind::Web || kind == PageKind::Blank {
+            if kind == PageKind::Blank {
+                "Search or enter address".to_string()
+            } else if title.trim().is_empty() {
+                store::editable_url(&url)
+            } else {
+                title.clone()
+            }
+        } else {
+            kind.title().to_string()
+        };
+        self.address_label.set_text(&label);
+        if url.is_empty() {
+            self.address_label
+                .set_tooltip_text(Some("Search or enter an address — Ctrl+L"));
+        } else {
+            self.address_label.set_tooltip_text(Some(&url));
+        }
+        let window_title = if kind == PageKind::Blank || url.is_empty() {
+            "Search".to_string()
+        } else {
+            format!("{} — Search", title)
+        };
+        self.window.set_title(&window_title);
+        for (button, open) in [
+            (&self.back, can_back),
+            (&self.forward, can_forward),
+            (&self.strip_back, can_back),
+            (&self.strip_forward, can_forward),
+            (&self.top_back, can_back),
+            (&self.top_forward, can_forward),
+        ] {
+            button.set_sensitive(open);
+        }
+        if self.reload_shows_stop.get() != Some(loading) {
+            self.reload_shows_stop.set(Some(loading));
+            let icon = gtk::Image::from_icon_name(
+                Some(if loading {
+                    "process-stop-symbolic"
+                } else {
+                    "view-refresh-symbolic"
+                }),
+                gtk::IconSize::Menu,
+            );
+            icon.set_pixel_size(15);
+            self.reload_button.set_image(Some(&icon));
+            self.reload_button.set_tooltip_text(Some(if loading {
+                "Stop — Ctrl+R"
+            } else {
+                "Reload — Ctrl+R"
+            }));
+            let small = gtk::Image::from_icon_name(
+                Some(if loading {
+                    "process-stop-symbolic"
+                } else {
+                    "view-refresh-symbolic"
+                }),
+                gtk::IconSize::Menu,
+            );
+            small.set_pixel_size(12);
+            self.strip_reload.set_image(Some(&small));
+            self.strip_reload.set_tooltip_text(self.reload_button.tooltip_text().as_deref());
+            let top_small = gtk::Image::from_icon_name(
+                Some(if loading {
+                    "process-stop-symbolic"
+                } else {
+                    "view-refresh-symbolic"
+                }),
+                gtk::IconSize::Menu,
+            );
+            top_small.set_pixel_size(14);
+            self.top_reload.set_image(Some(&top_small));
+            self.top_reload
+                .set_tooltip_text(self.reload_button.tooltip_text().as_deref());
+        }
+
+        let top_text = if kind == PageKind::Blank || url.is_empty() {
+            "Search or enter address".to_string()
+        } else {
+            store::editable_url(&url)
+        };
+        self.top_url.set_text(&top_text);
+        self.top_address.set_tooltip_text(Some(if url.is_empty() {
+            "Search or enter an address — Ctrl+L"
+        } else {
+            url.as_str()
+        }));
+
+        let blocking = {
+            let prefs = self.prefs.borrow();
+            prefs.adblock && !prefs.shield_paused_on(&store::bare_host(&url))
+        };
+        if blocking {
+            self.ublock_button.style_context().add_class("active");
+            self.ublock_button.set_tooltip_text(Some("uBlock filters are on"));
+        } else {
+            self.ublock_button.style_context().remove_class("active");
+            self.ublock_button
+                .set_tooltip_text(Some("uBlock filters are off here"));
+        }
+
+        let _ = (pinned, muted);
+    }
+}
+
+// ------------------------------------------------------------------- chrome
+
+impl Browser {
+    fn rebuild_tabs(self: &Rc<Self>) {
+        while let Some(child) = self.rows.children().first().cloned() {
+            self.rows.remove(&child);
+        }
+        while let Some(child) = self.pins.children().first().cloned() {
+            self.pins.remove(&child);
+        }
+        while let Some(child) = self.strip.children().first().cloned() {
+            self.strip.remove(&child);
+        }
+
+        let (glyphs, roomy, shortcuts, width) = {
+            let prefs = self.prefs.borrow();
+            (
+                prefs.glyph == "icons",
+                prefs.roomy_tabs,
+                prefs.show_tab_shortcuts,
+                prefs.side_width,
+            )
+        };
+        let row_h = if roomy { 36 } else { 28 };
+        let active_id = self
+            .active_index()
+            .map(|index| self.tabs.borrow()[index].id)
+            .unwrap_or(0);
+        let info: Vec<(usize, u64, String, String, Option<String>, Option<gdk_pixbuf::Pixbuf>, bool)> = {
+            let tabs = self.tabs.borrow();
+            tabs.iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    (
+                        index,
+                        tab.id,
+                        tab.display_title(),
+                        tab.pin.clone().unwrap_or_default(),
+                        tab.pin.clone(),
+                        tab.favicon.clone(),
+                        tab.id == active_id,
+                    )
+                })
+                .collect()
+        };
+
+        // ---- the pins: at most four across, each row filling the column
+        // between its 10-point margins. A row of fewer than three keeps
+        // three places, so one pin does not stretch the width of a page.
+        let pinned: Vec<_> = info.iter().filter(|entry| entry.4.is_some()).collect();
+        let loose = info.len() - pinned.len();
+        let room = (width - 20).max(20);
+        let gap = 4;
+        let fits = ((room + gap) / (34 + gap)).clamp(1, 4) as usize;
+        let rows = pin_rows(pinned.len(), fits);
+        let mut at = 0usize;
+        for count in &rows {
+            let slots = if rows.len() == 1 {
+                (*count).max(3.min(fits))
+            } else {
+                *count
+            };
+            let cell = ((room - (slots as i32 - 1) * gap) / slots as i32).max(20);
+            let height = cell.min(34);
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(gap as u32);
+            grid.set_hexpand(true);
+            grid.set_halign(gtk::Align::Fill);
+            for col in 0..*count {
+                let Some((_, id, title, pin_label, _, favicon, active)) = pinned.get(at).copied() else {
+                    break;
+                };
+                let id = *id;
+                at += 1;
+                let button = gtk::Button::new();
+                button.set_relief(gtk::ReliefStyle::None);
+                button.style_context().add_class("pin");
+                if *active {
+                    button.style_context().add_class("active");
+                }
+                let mark = if glyphs && favicon.is_some() {
+                    let image = gtk::Image::from_pixbuf(favicon.as_ref());
+                    image.set_pixel_size(16);
+                    image.upcast::<gtk::Widget>()
+                } else {
+                    let letter = util::label(&first_letter(pin_label, title), Some("pin-letter"));
+                    letter.set_halign(gtk::Align::Center);
+                    letter.upcast::<gtk::Widget>()
+                };
+                button.add(&mark);
+                button.set_tooltip_text(Some(title));
+                button.set_size_request(cell, height);
+                button.set_hexpand(true);
+                let weak = self.this.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(browser) = weak.upgrade() {
+                        browser.switch_to_id(id);
+                    }
+                });
+                let weak = self.this.clone();
+                let relative = button.clone();
+                button.connect_button_press_event(move |_button, event| {
+                    if event.button() == 3 {
+                        if let Some(browser) = weak.upgrade() {
+                            browser.tab_menu(id, &relative);
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                    glib::Propagation::Proceed
+                });
+                grid.attach(&button, col as i32, 0, 1, 1);
+            }
+            self.pins.pack_start(&grid, false, false, 0);
+        }
+
+        // ---- the strip's run: every tab, a pinned square first. Its width
+        // is the window's, less what the lights, the doors and the plus take;
+        // inside it the loose tabs share what is left, down to their marks.
+        let strip_room = {
+            let allocated = self.strip_wrap.allocation().width();
+            if allocated > 80 {
+                allocated
+            } else {
+                (self.window.size().0 - 100 - 12 - 230).max(160)
+            }
+        };
+        let pin_line = !pinned.is_empty() && loose > 0;
+        let spent = pinned.len() as i32 * (30 + 2)
+            + if pin_line { 3 } else { 0 }
+            + 30
+            + 2;
+        let each = if loose == 0 {
+            186
+        } else {
+            (((strip_room - spent).max(0)) / loose as i32).clamp(36, 186)
+        };
+        let compact = each < 80;
+        let grid = gtk::Grid::new();
+        grid.set_column_spacing(2);
+        grid.set_halign(gtk::Align::Start);
+        grid.set_valign(gtk::Align::Center);
+        let mut column = 0i32;
+        let mut line_added = false;
+        let mut active_pill: Option<gtk::Widget> = None;
+        for (index, id, title, pin_label, pin, favicon, active) in info.iter() {
+            let id = *id;
+            let mark = |size: i32, pin: bool| -> gtk::Widget {
+                if glyphs && favicon.is_some() {
+                    let image = gtk::Image::from_pixbuf(favicon.as_ref());
+                    image.set_pixel_size(size);
+                    image.set_valign(gtk::Align::Center);
+                    image.upcast::<gtk::Widget>()
+                } else {
+                    let class = if pin { "pin-letter" } else { "tab-badge" };
+                    let letter = util::label(
+                        &first_letter(if pin { pin_label } else { "" }, title),
+                        Some(class),
+                    );
+                    letter.set_valign(gtk::Align::Center);
+                    letter.upcast::<gtk::Widget>()
+                }
+            };
+
+            // The sidebar's rows, for the tabs that come and go.
+            if pin.is_none() {
+                let event = gtk::EventBox::new();
+                event.set_visible_window(true);
+                event.style_context().add_class("tab-row");
+                event.add_events(gdk::EventMask::ENTER_NOTIFY_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
+                if *active {
+                    event.style_context().add_class("active");
+                }
+                if roomy {
+                    event.style_context().add_class("roomy");
+                }
+                event.set_size_request(-1, row_h);
+                event.set_hexpand(true);
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                row.set_margin_start(10);
+                row.set_margin_end(7);
+                row.pack_start(&mark(if roomy { 17 } else { 15 }, false), false, false, 0);
+                let shown = if shortcuts {
+                    format!("{}  {}", index + 1, title)
+                } else {
+                    title.clone()
+                };
+                let title_label = util::label(&shown, Some("tab-title"));
+                title_label.set_hexpand(true);
+                title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                row.pack_start(&title_label, true, true, 0);
+                let close = close_button();
+                row.pack_start(&close, false, false, 0);
+                event.add(&row);
+
+                let weak = self.this.clone();
+                close.connect_clicked(move |_| {
+                    if let Some(browser) = weak.upgrade() {
+                        browser.close_tab_id(id);
+                    }
+                });
+                let weak = self.this.clone();
+                let relative = event.clone();
+                event.connect_button_press_event(move |_event, press| {
+                    if let Some(browser) = weak.upgrade() {
+                        match press.button() {
+                            1 => {
+                                browser.switch_to_id(id);
+                                return glib::Propagation::Stop;
+                            }
+                            2 => {
+                                browser.close_tab_id(id);
+                                return glib::Propagation::Stop;
+                            }
+                            3 => {
+                                browser.tab_menu(id, &relative);
+                                return glib::Propagation::Stop;
+                            }
+                            _ => {}
+                        }
+                    }
+                    glib::Propagation::Proceed
+                });
+                self.rows.pack_start(&event, false, false, 0);
+            }
+
+            // The line between what is kept and what comes and goes.
+            if pin.is_none() && pin_line && !line_added {
+                let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                line.style_context().add_class("pin-line");
+                line.set_size_request(1, 20);
+                line.set_valign(gtk::Align::Center);
+                grid.attach(&line, column, 0, 1, 1);
+                column += 1;
+                line_added = true;
+            }
+
+            // Across the top: a pinned square or a titled pill.
+            let is_pinned = pin.is_some();
+            let span = if is_pinned { 30 } else { each };
+            let event = gtk::EventBox::new();
+            event.set_visible_window(true);
+            event.style_context().add_class("tab-pill");
+            event.add_events(gdk::EventMask::ENTER_NOTIFY_MASK | gdk::EventMask::LEAVE_NOTIFY_MASK);
+            if is_pinned {
+                event.style_context().add_class("pinned");
+            } else if compact {
+                event.style_context().add_class("compact");
+            }
+            if *active {
+                event.style_context().add_class("active");
+            }
+            event.set_size_request(span, 28);
+            event.set_valign(gtk::Align::Center);
+            if *active {
+                active_pill = Some(event.clone().upcast());
+            }
+            let pill = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            if is_pinned || compact {
+                pill.set_halign(gtk::Align::Center);
+                pill.set_valign(gtk::Align::Center);
+                pill.pack_start(&mark(if is_pinned { 16 } else { 15 }, is_pinned), false, false, 0);
+            } else {
+                pill.set_margin_start(11);
+                pill.set_margin_end(7);
+                pill.pack_start(&mark(15, false), false, false, 0);
+                let title_label = util::label(title, Some("tab-title"));
+                title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title_label.set_hexpand(true);
+                pill.pack_start(&title_label, true, true, 0);
+                let close = close_button();
+                pill.pack_start(&close, false, false, 0);
+                let weak = self.this.clone();
+                close.connect_clicked(move |_| {
+                    if let Some(browser) = weak.upgrade() {
+                        browser.close_tab_id(id);
+                    }
+                });
+            }
+            event.add(&pill);
+            let weak = self.this.clone();
+            let relative = event.clone();
+            event.connect_button_press_event(move |_event, press| {
+                if let Some(browser) = weak.upgrade() {
+                    match press.button() {
+                        1 => {
+                            browser.switch_to_id(id);
+                            return glib::Propagation::Stop;
+                        }
+                        2 => {
+                            browser.close_tab_id(id);
+                            return glib::Propagation::Stop;
+                        }
+                        3 => {
+                            browser.tab_menu(id, &relative);
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+            event.set_tooltip_text(Some(title));
+            grid.attach(&event, column, 0, 1, 1);
+            column += 1;
+        }
+
+        self.strip.pack_start(&grid, false, false, 0);
+        let plus = gtk::Button::new();
+        plus.set_relief(gtk::ReliefStyle::None);
+        plus.style_context().add_class("tab-plus");
+        plus.add(&util::image_icon("tab-new-symbolic", 11));
+        plus.set_size_request(30, 28);
+        plus.set_valign(gtk::Align::Center);
+        plus.set_tooltip_text(Some("New tab — Ctrl+T"));
+        let weak = self.this.clone();
+        plus.connect_clicked(move |_| {
+            if let Some(browser) = weak.upgrade() {
+                browser.new_tab(None, false);
+            }
+        });
+        self.strip.pack_start(&plus, false, false, 0);
+        let air = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        air.set_hexpand(true);
+        self.strip.pack_start(&air, true, true, 0);
+
+        // The row that makes another, right under the tabs; and the small
+        // square in the strip that does the same.
+        let fresh = new_tab_row();
+        let weak = self.this.clone();
+        fresh.connect_button_press_event(move |_event, press| {
+            if press.button() == 1 {
+                if let Some(browser) = weak.upgrade() {
+                    browser.new_tab(None, false);
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.rows.pack_start(&fresh, false, false, 0);
+
+        self.strip.show_all();
+        self.rows.show_all();
+        self.pins.show_all();
+        self.pins_wrap.set_visible(!pinned.is_empty());
+
+        // Keep the tab you are on in view when the run is longer than the
+        // strip: the row scrolls inside its own edges, never under the
+        // lights nor over the doors.
+        *self.active_pill.borrow_mut() = active_pill;
+        let weak = self.this.clone();
+        glib::idle_add_local(move || {
+            if let Some(browser) = weak.upgrade() {
+                browser.scroll_active_into_view();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn scroll_active_into_view(&self) {
+        let Some(pill) = self.active_pill.borrow().clone() else {
+            return;
+        };
+        if !pill.is_visible() {
+            return;
+        }
+        let adjust = self.strip_scroll.hadjustment();
+        let page = adjust.page_size();
+        if page <= 1.0 {
+            return;
+        }
+        let Some((x, _)) = pill.translate_coordinates(&self.strip, 0, 0) else {
+            return;
+        };
+        let x = x as f64;
+        let w = pill.allocation().width() as f64;
+        let value = adjust.value();
+        if x < value {
+            adjust.set_value(x);
+        } else if x + w > value + page {
+            adjust.set_value((x + w - page).max(0.0));
+        }
+    }
+
+    fn show_auto_sidebar(&self) {
+        self.sidebar_edge.set_visible(false);
+        self.sidebar_revealer.set_reveal_child(true);
+        // Fold the bar's left strip away over the same 180 ms as the
+        // column's slide. The page column moves right by exactly the width
+        // this strip gives up, so the address bar stays put on screen.
+        self.top_left_revealer.set_reveal_child(false);
+        if let Some(browser) = self.this.upgrade() {
+            browser.track_chrome_animation();
+        }
+        if self.top_bar_active() {
+            // Keep the full top bar (with its buttons and length) unchanged.
+            self.use_full_top_bar_layout();
+            self.top_bar_full.set(true);
+            self.top_edge.set_visible(false);
+            return;
+        }
+        self.top_bar_full.set(false);
+        self.sync_side_top();
+    }
+
+    fn hide_auto_sidebar(&self) {
+        let was_active = self.top_bar_active() || self.top_url_revealer.reveals_child() || self.top_controls_pinned.get();
+        self.sidebar_revealer.set_reveal_child(false);
+        // The column folds away and the bar's own strip expands into the
+        // gap over the same 180 ms, again keeping the address in place.
+        self.top_left_revealer.set_reveal_child(true);
+        if let Some(browser) = self.this.upgrade() {
+            browser.track_chrome_animation();
+        }
+        let enabled = {
+            let prefs = self.prefs.borrow();
+            prefs.auto_hide_sidebar && prefs.sidebar
+        };
+        self.sidebar_edge.set_visible(enabled);
+        if was_active {
+            // Keep the bar active as a full top bar with unchanged length/form.
+            self.top_controls_pinned.set(false);
+            self.top_revealed.set(true);
+            self.use_full_top_bar_layout();
+            self.top_bar_full.set(true);
+            self.top_edge.set_visible(false);
+            if let Some(browser) = self.this.upgrade() {
+                browser.sync_page_corners_soon();
+            }
+            if self.top_hide_source.borrow().is_none() {
+                if let Some(browser) = self.this.upgrade() {
+                    let weak = Rc::downgrade(&browser);
+                    let source = glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                        let Some(browser) = weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        if !browser.top_bar_active() {
+                            browser.top_hide_source.borrow_mut().take();
+                            browser.top_bar_full.set(false);
+                            browser.sync_side_top();
+                            return glib::ControlFlow::Break;
+                        }
+                        if !browser.pointer_over_top_bar() {
+                            browser.hide_top_bar();
+                            return glib::ControlFlow::Break;
+                        }
+                        glib::ControlFlow::Continue
+                    });
+                    *self.top_hide_source.borrow_mut() = Some(source);
+                }
+            }
+        } else {
+            self.top_bar_full.set(false);
+            self.sync_side_top();
+            self.top_edge.set_visible(enabled);
+        }
+    }
+
+    fn use_full_top_bar_layout(&self) {
+        // Put URL bar into the dropping top bar (next to controls).
+        if let Some(parent) = self.top_url_bar.parent() {
+            if parent == self.top_url_revealer.clone().upcast::<gtk::Widget>() {
+                self.top_url_revealer.remove(&self.top_url_bar);
+            } else if parent != self.top_bar.clone().upcast::<gtk::Widget>() {
+                if let Some(bin) = parent.downcast_ref::<gtk::Container>() {
+                    bin.remove(&self.top_url_bar);
+                }
+            }
+        }
+        if self.top_url_bar.parent().is_none() {
+            self.top_bar.pack_start(&self.top_url_bar, true, true, 0);
+        }
+        self.top_url_bar.show_all();
+        self.top_url_bar.style_context().remove_class("url-sidebar-drop");
+        self.top_url_revealer.set_reveal_child(false);
+        self.top_url_revealer.set_margin_start(0);
+        // top_revealer state managed by show/hide_top_bar callers
+    }
+
+    fn use_sidebar_top_bar_layout(&self) {
+        // Put URL bar back into overlay revealer (hidden unless used).
+        if let Some(parent) = self.top_url_bar.parent() {
+            if parent == self.top_bar.clone().upcast::<gtk::Widget>() {
+                self.top_bar.remove(&self.top_url_bar);
+            } else if parent != self.top_url_revealer.clone().upcast::<gtk::Widget>() {
+                if let Some(bin) = parent.downcast_ref::<gtk::Container>() {
+                    bin.remove(&self.top_url_bar);
+                }
+            }
+        }
+        if self.top_url_bar.parent().is_none() {
+            self.top_url_revealer.add(&self.top_url_bar);
+        }
+        self.top_url_bar.show_all();
+        self.top_revealer.set_reveal_child(false);
+        self.top_url_revealer.set_reveal_child(false);
+        self.top_url_revealer.set_margin_start(self.prefs.borrow().side_width);
+        self.top_bar_full.set(false);
+    }
+
+    fn sync_side_top(&self) {
+        // The column always keeps its own header while it is on screen.
+        // The dropping bar lives in the page column now, so nothing here
+        // has to fold, fade, or otherwise make room for it.
+        if !self.side_top.is_visible() {
+            self.side_top.set_visible(true);
+        }
+        // Update margin based on current state
+        let margin = if self.prefs.borrow().sidebar && !self.top_bar_active() && !self.top_bar_full.get() {
+            self.prefs.borrow().side_width
+        } else {
+            0
+        };
+        if self.top_url_revealer.margin_start() != margin {
+            self.top_url_revealer.set_margin_start(margin);
+        }
+        // Only update URL bar class if needed
+        let has_sidebar_drop = self.prefs.borrow().sidebar
+            && !self.top_bar_active()
+            && !self.top_bar_full.get()
+            && self.top_url_revealer.reveals_child();
+        let current_class = self.top_url_bar.style_context().has_class("url-sidebar-drop");
+        if has_sidebar_drop != current_class {
+            if has_sidebar_drop {
+                self.top_url_bar.style_context().add_class("url-sidebar-drop");
+            } else {
+                self.top_url_bar.style_context().remove_class("url-sidebar-drop");
+            }
+        }
+    }
+
+    fn top_bar_active(&self) -> bool {
+        // Active when either:
+        // - Full top bar is showing (top_bar_full + top_revealer revealed)
+        // - URL bar is showing in sidebar mode (top_url_revealer revealed)
+        if self.top_bar_full.get() {
+            self.top_revealer.reveals_child() || self.top_revealer.is_child_revealed()
+        } else {
+            self.top_url_revealer.reveals_child()
+        }
+    }
+
+    fn show_top_bar(&self) {
+        if self.top_revealer.reveals_child() {
+            // Already on its way out; do not restart the slide.
+            return;
+        }
+        self.top_edge.set_visible(false);
+        self.top_controls_pinned.set(false);
+        self.top_revealed.set(true);
+
+        // The complete bar (controls + URL) drops in above the page column.
+        // When the column is already out, its own lights and helm stay in
+        // the column; only the address strip and the bar's frame move.
+        self.use_full_top_bar_layout();
+        // Mirror the column's own target, not the lingering allocation:
+        // while the column is folding away, its strip is already growing
+        // into the gap, keeping the address fixed on screen.
+        let column_out = self.sidebar_revealer.reveals_child();
+        self.top_left_revealer.set_reveal_child(!column_out);
+        self.top_revealer.set_reveal_child(true);
+        self.top_bar_full.set(true);
+
+        // The card gap closes and the corner patches follow the slide.
+        if let Some(browser) = self.this.upgrade() {
+            browser.position_page_corners();
+            browser.track_chrome_animation();
+        }
+        
+        if self.top_hide_source.borrow().is_some() {
+            return;
+        }
+        let Some(browser) = self.this.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(&browser);
+        let source = glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            let Some(browser) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !browser.top_bar_active() && !browser.top_url_revealer.reveals_child() {
+                browser.top_hide_source.borrow_mut().take();
+                browser.top_bar_full.set(false);
+                browser.sync_side_top();
+                return glib::ControlFlow::Break;
+            }
+            if !browser.pointer_over_top_bar() {
+                browser.hide_top_bar();
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.top_hide_source.borrow_mut() = Some(source);
+    }
+
+    fn hide_top_bar(&self) {
+        if let Some(source) = self.top_hide_source.borrow_mut().take() {
+            source.remove();
+        }
+        // Determine which bar mode we're in and preserve the appropriate buttons.
+        let bar_was_out = self.top_bar_active();
+        let sidebar_visible = self.sidebar_visible_now();
+        let topbar_full = self.top_bar_full.get();
+        if sidebar_visible {
+            // The column stays out and keeps its header. Only the bar in
+            // the page column slides away. The bar keeps its contents
+            // while it slides up, so the address does not blink out.
+            self.top_controls_pinned.set(false);
+            self.top_revealed.set(false);
+            self.top_bar_full.set(false);
+            self.top_revealer.set_reveal_child(false);
+            self.top_url_revealer.set_reveal_child(false);
+            self.top_edge.set_visible(true);
+        } else if topbar_full {
+            // We're in full top bar mode - hide completely.
+            self.top_controls_pinned.set(false);
+            self.top_revealed.set(false);
+            self.top_bar_full.set(false);
+            self.top_revealer.set_reveal_child(false);
+            self.top_url_revealer.set_reveal_child(false);
+            self.top_left_revealer.set_reveal_child(true);
+            self.top_edge.set_visible(true);
+        } else {
+            // Transition state - preserve whatever is active.
+            self.sync_side_top();
+            self.top_edge.set_visible(true);
+        }
+        // Follow the slide back: the card gap reopens while the corner
+        // patches ride the moving page.
+        if let Some(browser) = self.this.upgrade() {
+            browser.position_page_corners();
+            browser.sync_page_corners_soon();
+            if bar_was_out {
+                browser.track_chrome_animation();
+            }
+        }
+    }
+
+    fn sidebar_visible_now(&self) -> bool {
+        let prefs = self.prefs.borrow();
+        let sidebar = prefs.sidebar;
+        let auto_hide = prefs.auto_hide_sidebar;
+        sidebar
+            && (!auto_hide
+                || self.sidebar_revealer.reveals_child()
+                || self.sidebar_revealer.is_child_revealed())
+    }
+
+    fn pointer_over_sidebar(&self, x: f64, y: f64) -> bool {
+        if !self.sidebar_visible_now() {
+            return false;
+        }
+        let width = self.prefs.borrow().side_width as f64;
+        x >= 0.0 && x <= width + 12.0 && y >= 0.0
+    }
+
+    fn show_top_url(&self) {
+        // Keep the full top bar (including top-left buttons) and stable form.
+        self.show_top_bar();
+    }
+
+    fn hide_top_url_only(&self) {
+        // No split URL-only mode: keep the bar whole while active.
+        self.hide_top_bar();
+    }
+
+    fn pointer_over_top_bar(&self) -> bool {
+        let Some(window) = self.window.window() else {
+            return true;
+        };
+        let Some(display) = gdk::Display::default() else {
+            return true;
+        };
+        let Some(seat) = display.default_seat() else {
+            return true;
+        };
+        let Some(pointer) = seat.pointer() else {
+            return true;
+        };
+        let (_, x, y, _) = window.device_position(&pointer);
+        let (width, _) = self.window.size();
+        x >= -24 && x <= width + 24 && y >= -24 && y <= TOP_BAR_HEIGHT
+    }
+
+    /// The pointer's position in window coordinates, whatever GdkWindow
+    /// happens to be under it. Event coordinates are unreliable here
+    /// because GTK reports them relative to the child window that received
+    /// the event, not to the toplevel.
+    fn pointer_position(&self) -> Option<(f64, f64)> {
+        let window = self.window.window()?;
+        let display = gdk::Display::default()?;
+        let seat = display.default_seat()?;
+        let pointer = seat.pointer()?;
+        let (_, x, y, _) = window.device_position_double(&pointer);
+        Some((x, y))
+    }
+
+    /// WebKit keeps pointer motion to itself on pages that do not run the
+    /// little reporting script (the PDF viewer, for one). A slow look at
+    /// the seat every so often keeps the sliding bars working there too.
+    fn watch_pointer(&self) {
+        let Some((x, y)) = self.pointer_position() else {
+            return;
+        };
+        let (width, height) = self.window.size();
+        let (width, height) = (width as f64, height as f64);
+        // Compositors leave a gap between the window and the screen edge.
+        // A few pixels beyond the frame still count as reaching the edge.
+        if (-24.0..0.0).contains(&y) && (-24.0..=width + 24.0).contains(&x) {
+            self.pointer_moved(x.clamp(0.0, width), 0.0);
+            return;
+        }
+        if (-24.0..0.0).contains(&x) && (0.0..=height).contains(&y) {
+            self.pointer_moved(0.0, y);
+            return;
+        }
+        if x < 0.0 || y < 0.0 || x > width || y > height {
+            if self.top_bar_active() || self.top_revealed.get() {
+                self.hide_top_bar();
+            }
+            // Don't hide auto_sidebar in watch_pointer - let pointer_moved handle it
+            // to avoid flickering when cursor is over sidebar buttons.
+            // The sidebar will be managed by the enter/leave events and pointer_moved.
+            return;
+        }
+        self.pointer_moved(x, y);
+    }
+
+    /// Motion over a page arrives through the page's own script; motion
+    /// over GTK chrome arrives through the window. Both land here.
+    fn pointer_moved(&self, x: f64, y: f64) {
+        let (auto_sidebar, width) = {
+            let prefs = self.prefs.borrow();
+            (prefs.auto_hide_sidebar && prefs.sidebar, prefs.side_width as f64)
+        };
+        if auto_sidebar {
+            let (ww, _) = self.window.size();
+            // Only a very slim strip against the left edge brings the column back.
+            let show_zone = (ww as f64 / 64.0).clamp(8.0, 20.0);
+            if self.sidebar_revealer.reveals_child() {
+                // As soon as the pointer is off the column (or the frame gap
+                // next to it), tuck it away without a wait.
+                // Original behavior: hide when cursor is past the sidebar width.
+                // The sidebar_edge enter_notify_event will bring it back
+                // when the pointer re-enters the left-edge strip.
+                // Don't hide if cursor is in the top area (near new tab button)
+                // to prevent flickering when hovering add-tab button.
+                // Use a generous top zone threshold (70px from window top)
+                if x > width + 4.0 && y > 70.0 {
+                    self.hide_auto_sidebar();
+                }
+            } else if x >= 0.0 && x <= show_zone {
+                self.show_auto_sidebar();
+            }
+        }
+
+        let (_, wh) = self.window.size();
+        let show_zone = (wh as f64 / 64.0).clamp(8.0, 20.0);
+
+        // Show top bar when pointer is in the top interactive zone
+        // This will displace the web content, not superpose
+        if y >= 0.0 && y <= show_zone {
+            // Pointer is in the top zone - show top bar
+            // The apply_layout function will handle displacing the web content
+            self.show_top_bar();
+        } else if y > TOP_BAR_HEIGHT as f64 + 4.0 {
+            // Pointer is below the top bar - hide it (if active)
+            // But only if we're not in a mode where it should stay
+            // Also, don't hide if the pointer is still close to the top edge
+            if self.top_bar_active() && !self.top_controls_pinned.get() && y > TOP_BAR_HEIGHT as f64 + 20.0 {
+                self.hide_top_bar();
+            }
+        }
+    }
+
+    fn sync_page_corners_soon(self: &Rc<Self>) {
+        // Schedule page corner repositioning for the next GTK idle cycle
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            if let Some(browser) = weak.upgrade() {
+                browser.position_page_corners();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Follow the 160 ms slide of the top bar frame by frame: the corner
+    /// patches stay glued to the moving card, and the card's top gap
+    /// opens or closes with the bar instead of jumping.
+    fn track_chrome_animation(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let started = std::time::Instant::now();
+        self.window.add_tick_callback(move |_, _| {
+            let Some(browser) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let (cards, sidebar) = {
+                let prefs = browser.prefs.borrow();
+                (prefs.cards, prefs.sidebar)
+            };
+            // The revealed height of the bar is the animation's clock,
+            // so this stays in step with the revealer's own easing.
+            let revealed = browser.top_revealer.allocated_height() as f64;
+            let progress = (revealed / TOP_BAR_HEIGHT as f64).clamp(0.0, 1.0);
+            if cards && sidebar {
+                let gap = ((1.0 - progress) * 8.0).round() as i32;
+                browser.main.set_margin_top(gap);
+            }
+            browser.position_page_corners();
+            if started.elapsed() < std::time::Duration::from_millis(240) {
+                glib::ControlFlow::Continue
+            } else {
+                // Land on the exact resting state even if the allocation
+                // read above was one frame behind.
+                let bars_out = browser.top_revealer.is_child_revealed();
+                if cards && sidebar {
+                    browser.main.set_margin_top(if bars_out { 0 } else { 8 });
+                }
+                browser.position_page_corners();
+                browser.sync_page_corners_soon();
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
+    fn apply_layout(self: &Rc<Self>) {
+        let (sidebar, cards, right, width, bar, has_bar) = {
+            let prefs = self.prefs.borrow();
+            (
+                prefs.sidebar,
+                prefs.cards,
+                prefs.side_position == "right",
+                prefs.side_width,
+                prefs.bookmarks_bar,
+                !self.bookmarks.borrow().empty(),
+            )
+        };
+        let auto_hide = self.prefs.borrow().auto_hide_sidebar && sidebar;
+        self.sidebar_edge.set_visible(auto_hide);
+        self.sidebar.set_size_request(width, -1);
+        self.top_left.set_size_request(width, -1);
+        // The revealer always lives in the root box: when hidden it simply
+        // collapses to zero, letting the page use the whole window.
+        let in_overlay = self.sidebar_revealer.parent().map(|p| p == self.overlay.clone().upcast::<gtk::Widget>()).unwrap_or(false);
+        if in_overlay {
+            self.overlay.remove(&self.sidebar_revealer);
+            self.root.pack_start(&self.sidebar_revealer, false, true, 0);
+        }
+        self.sidebar_revealer.set_reveal_child(if auto_hide { false } else { sidebar });
+        // The bar's left strip is the mirror of the column: folded away
+        // exactly while the column is out, so the address starts at the
+        // column's edge instead of leaving a gap.
+        self.top_left_revealer
+            .set_reveal_child(!self.sidebar_revealer.reveals_child());
+        if sidebar {
+            let children = self.root.children();
+            let revealer_widget = self.sidebar_revealer.clone().upcast::<gtk::Widget>();
+            let first_is_sidebar = children
+                .first()
+                .map(|child| child == &revealer_widget)
+                .unwrap_or(false);
+            if first_is_sidebar == right {
+                self.root.reorder_child(&self.sidebar_revealer, if right { 1 } else { 0 });
+            }
+        }
+        if right {
+            self.sidebar.style_context().add_class("right");
+        } else {
+            self.sidebar.style_context().remove_class("right");
+        }
+        // The strip is the title bar when the column is folded away. With
+        // the column out, its own corner carries the lights and the helm,
+        // and the page begins at the window's very top.
+        self.chrome.set_visible(!sidebar);
+        self.strip_wrap.set_visible(!sidebar);
+
+        // Only override state if not already in a valid mode
+        // This prevents apply_layout from clobbering the current mode
+        if !self.top_bar_full.get() && !self.top_url_revealer.reveals_child() {
+            // Idle state - prepare sidebar layout
+            self.use_sidebar_top_bar_layout();
+            self.top_edge.set_visible(true);
+        } else if self.top_bar_full.get() {
+            // Full top bar mode
+            self.use_full_top_bar_layout();
+            self.top_edge.set_visible(false);
+        } else if self.top_url_revealer.reveals_child() {
+            // URL-only mode (sidebar active)
+            self.use_sidebar_top_bar_layout();
+            self.top_edge.set_visible(false);
+        }
+        if cards && sidebar {
+            self.root.style_context().add_class("carded");
+            self.sidebar.style_context().add_class("on-frame");
+            self.top_bar.style_context().add_class("carded");
+            self.top_url_bar.style_context().add_class("url-on-frame");
+            self.top_url_bar.style_context().remove_class("url-on-ground");
+            // When topbar not active: all margins = 8px (same thickness on all sides)
+            // When topbar active: top margin = 0 (flush against topbar), others = 8px
+            let top_margin = if self.top_bar_active() { 0 } else { 8 };
+            self.main.set_margin_top(top_margin);
+            self.main.set_margin_bottom(8);
+            self.main.set_margin_start(8);
+            self.main.set_margin_end(8);
+            self.page_wrap.set_margin_top(0);
+            self.page_card.style_context().add_class("page-card");
+            self.refresh_page_corners();
+        } else {
+            // No cards: the sidebar column and the page column already
+            // divide the window between them, and the bar only pushes the
+            // page column. No extra margins are needed.
+            self.main.set_margin_start(0);
+            self.main.set_margin_top(0);
+            self.main.set_margin_end(0);
+            self.main.set_margin_bottom(0);
+            self.page_wrap.set_margin_top(0);
+            self.page_wrap.set_margin_bottom(0);
+            self.page_card.style_context().remove_class("page-card");
+        }
+        for corner in &self.page_corners {
+            corner.set_visible(cards && sidebar);
+        }
+        self.bookmarks_bar.set_visible(bar && has_bar);
+        self.position_page_corners();
+        self.rebuild_tabs();
+        // A layout change can also move the column (prefs toggle, width
+        // change). Follow it for a moment so the card's corners stay glued
+        // to the card instead of snapping after the fact.
+        self.track_chrome_animation();
+        // Ensure margins are set correctly based on bar visibility
+        // (already handled above in the if/else blocks)
+    }
+
+    fn refresh_page_corners(&self) {
+        let look = self.prefs.borrow().look.clone();
+        let frame = util::frame_rgba(&look);
+        let edge = util::card_edge_rgba(&look);
+        for (index, image) in self.page_corners.iter().enumerate() {
+            let pixbuf = page_corner(PAGE_RADIUS, PAGE_PAD, index as u8, frame, edge);
+            image.set_from_pixbuf(Some(&pixbuf));
+        }
+    }
+
+    /// Keep the four patches glued to the card as the sidebar slides the
+    /// page sideways. They live on the window overlay, one pixel outside the
+    /// card on the outer sides, so the card's square child cannot peek past
+    /// the rounded frame.
+    fn position_page_corners(&self) {
+        let Some((cx, cy)) = self.page_card.translate_coordinates(&self.window, 0, 0) else {
+            return;
+        };
+        let cw = self.page_card.allocated_width();
+        let ch = self.page_card.allocated_height();
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
+        let (ww, wh) = self.window.size();
+        let x0 = cx;
+        let y0 = cy;
+        let x1 = cx + cw;
+        let y1 = cy + ch;
+        for (index, corner) in self.page_corners.iter().enumerate() {
+            let left = index % 2 == 0;
+            let top = index < 2;
+            corner.set_margin_start(if left { (x0 - PAGE_PAD).max(0) } else { 0 });
+            corner.set_margin_end(if left { 0 } else { (ww - x1 - PAGE_PAD).max(0) });
+            corner.set_margin_top(if top { (y0 - PAGE_PAD).max(0) } else { 0 });
+            corner.set_margin_bottom(if top { 0 } else { (wh - y1 - PAGE_PAD).max(0) });
+        }
+    }
+
+    fn apply_look(self: &Rc<Self>) {
+        let look = self.prefs.borrow().look.clone();
+        // Install CSS - minimal overhead for this static content
+        util::install_css(&look);
+        self.refresh_page_corners();
+        let dark = match look.as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => util::system_prefers_dark(),
+        };
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(dark);
+        }
+        let background = self.page_background();
+        // Switch the internal pages over in place. Reloading them would work,
+        // but it would also throw away the settings pane and scroll position
+        // the reader was looking at.
+        let script = match look.as_str() {
+            "dark" | "light" => format!(
+                "document.documentElement.dataset.look = {:?}; delete document.documentElement.dataset.systemDark;",
+                look
+            ),
+            _ => format!(
+                "delete document.documentElement.dataset.look; document.documentElement.dataset.systemDark = {:?};",
+                if dark { "1" } else { "" }
+            ),
+        };
+        for tab in self.tabs.borrow().iter() {
+            tab.view.set_background_color(&background);
+            if tab.kind.internal() {
+                self.run_js(&tab.view, &script);
+            }
+        }
+    }
+
+    fn toggle_sidebar(self: &Rc<Self>) {
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            prefs.sidebar = !prefs.sidebar;
+            prefs.save();
+        }
+        self.apply_layout();
+        self.save_session();
+    }
+
+    fn rebuild_bookmarks_bar(self: &Rc<Self>) {
+        while let Some(child) = self.bookmarks_bar.children().first().cloned() {
+            self.bookmarks_bar.remove(&child);
+        }
+        let items: Vec<(String, String)> = self
+            .bookmarks
+            .borrow()
+            .roots
+            .iter()
+            .filter(|bookmark| bookmark.url.is_some())
+            .map(|bookmark| {
+                (
+                    bookmark.label(),
+                    bookmark.url.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        for (title, url) in items {
+            let button = gtk::Button::with_label(&title);
+            button.set_relief(gtk::ReliefStyle::None);
+            button.set_tooltip_text(Some(&url));
+            let weak = self.this.clone();
+            button.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.navigate(&url);
+                }
+            });
+            self.bookmarks_bar.pack_start(&button, false, false, 0);
+        }
+        let visible = self.prefs.borrow().bookmarks_bar && !self.bookmarks.borrow().empty();
+        self.bookmarks_bar.set_visible(visible);
+        self.bookmarks_bar.show_all();
+        self.bookmarks_bar.set_visible(visible);
+    }
+
+    fn tab_menu(self: &Rc<Self>, id: u64, relative: &impl IsA<gtk::Widget>) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let (pinned, muted, title) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (tab.pin.is_some(), tab.muted, tab.display_title())
+        };
+        let popover = gtk::Popover::new(Some(relative));
+        popover.set_position(gtk::PositionType::Bottom);
+        popover.set_modal(true);
+        popover.style_context().add_class("menu-popover");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        content.set_size_request(230, -1);
+        content.set_margin_top(4);
+        content.set_margin_bottom(4);
+        content.set_margin_start(4);
+        content.set_margin_end(4);
+        popover.add(&content);
+        let weak = self.this.clone();
+
+        add_menu_item(
+            &content,
+            &popover,
+            if pinned { "Unpin Tab" } else { "Pin Tab" },
+            "",
+            &weak,
+            Box::new(move |browser| browser.toggle_pin(id)),
+        );
+        add_menu_item(
+            &content,
+            &popover,
+            if muted { "Unmute Tab" } else { "Mute Tab" },
+            "",
+            &weak,
+            Box::new(move |browser| browser.mute_tab(id)),
+        );
+        add_menu_item(
+            &content,
+            &popover,
+            "Rename Tab…",
+            "",
+            &weak,
+            Box::new(move |browser| browser.rename_tab(id)),
+        );
+        add_menu_item(
+            &content,
+            &popover,
+            "Duplicate Tab",
+            "",
+            &weak,
+            Box::new(move |browser| browser.duplicate_tab(id)),
+        );
+        add_menu_item(
+            &content,
+            &popover,
+            "Open Beside This One",
+            "",
+            &weak,
+            Box::new(move |browser| browser.split_with(id)),
+        );
+        content.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+        add_menu_item(
+            &content,
+            &popover,
+            "Close Tab",
+            "Ctrl+W",
+            &weak,
+            Box::new(move |browser| browser.close_tab_id(id)),
+        );
+        let _ = title;
+        content.show_all();
+        popover.popup();
+    }
+
+    fn toggle_pin(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let tab = &mut tabs[index];
+            if tab.pin.is_some() {
+                tab.pin = None;
+                tab.home = None;
+            } else {
+                let label = tab.display_title();
+                tab.pin = Some(label);
+                if tab.home.is_none() {
+                    tab.home = Some(tab.url.clone());
+                }
+            }
+        }
+        self.rebuild_tabs();
+        self.refresh_header();
+        self.save_session();
+    }
+
+    fn mute_tab(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let muted = {
+            let mut tabs = self.tabs.borrow_mut();
+            let tab = &mut tabs[index];
+            tab.muted = !tab.muted;
+            tab.view.set_is_muted(tab.muted);
+            tab.muted
+        };
+        self.rebuild_tabs();
+        if muted {
+            self.toast("Muted");
+        }
+        self.save_session();
+    }
+
+    fn rename_tab(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let current = self.tabs.borrow()[index]
+            .name
+            .clone()
+            .unwrap_or_else(|| self.tabs.borrow()[index].display_title());
+        let Some(name) = self.prompt("Name This Tab", "A name only this tab wears.", &current) else {
+            return;
+        };
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            tabs[index].name = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name.trim().to_string())
+            };
+        }
+        self.rebuild_tabs();
+        self.refresh_header();
+        self.save_session();
+    }
+
+    fn duplicate_tab(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let url = self.tabs.borrow()[index].url.clone();
+        if url.is_empty() {
+            return;
+        }
+        self.add_tab(Some(&url), false, true, None, None, None, false);
+    }
+
+    fn zoom_by(self: &Rc<Self>, delta: f64) {
+        let zoom = {
+            let mut prefs = self.prefs.borrow_mut();
+            prefs.page_zoom = (prefs.page_zoom + delta).clamp(0.5, 2.5);
+            prefs.page_zoom
+        };
+        for tab in self.tabs.borrow().iter() {
+            tab.view.set_zoom_level(zoom);
+        }
+        self.prefs.borrow().save();
+        self.toast(&format!("{:.0}%", zoom * 100.0));
+    }
+
+    fn zoom_reset(self: &Rc<Self>) {
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            prefs.page_zoom = 1.0;
+            prefs.save();
+        }
+        for tab in self.tabs.borrow().iter() {
+            tab.view.set_zoom_level(1.0);
+        }
+        self.toast("Actual size");
+    }
+
+    fn toggle_split(self: &Rc<Self>) {
+        if self.split_second.get().is_some() {
+            self.unsplit();
+            return;
+        }
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let length = self.tabs.borrow().len();
+        if length < 2 {
+            self.toast("Open another page to put it beside this one");
+            return;
+        }
+        let other = (index + 1) % length;
+        let id = self.tabs.borrow()[other].id;
+        self.split_with(id);
+    }
+
+    fn split_with(self: &Rc<Self>, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let Some(active) = self.active_index() else {
+            return;
+        };
+        if index == active {
+            self.toast("That page is already in front");
+            return;
+        }
+        if self.split_second.get().is_some() {
+            self.unsplit();
+        }
+        let view = self.tabs.borrow()[index].view.clone();
+        // Move the view out of the stack first: GtkPaned refuses a child that
+        // still has a parent, and leaving it there trips draw assertions.
+        self.stack.remove(&view);
+        self.paned.add2(&view);
+        view.show();
+        let width = self.page_card.allocated_width().max(600);
+        self.paned.set_position(width / 2);
+        self.split_second.set(Some(id));
+        self.toast("Split view — Ctrl+Alt+N to close");
+    }
+
+    fn unsplit(self: &Rc<Self>) {
+        let second = self.split_second.get();
+        if let Some(child) = self.paned.child2() {
+            self.paned.remove(&child);
+            if let Some(id) = second {
+                self.stack.add_named(&child, &id.to_string());
+            }
+            child.show();
+        }
+        self.split_second.set(None);
+        if let Some(index) = self.active_index() {
+            let id = self.tabs.borrow()[index].id;
+            self.stack.set_visible_child_name(&id.to_string());
+        }
+    }
+
+    fn toast(self: &Rc<Self>, text: &str) {
+        self.show_toast(text, None, None);
+    }
+
+    fn show_toast(
+        self: &Rc<Self>,
+        text: &str,
+        action: Option<&str>,
+        command: Option<ToastCommand>,
+    ) {
+        self.toast_label.set_text(text);
+        self.toast_button.set_visible(action.is_some());
+        if let Some(action) = action {
+            self.toast_button.set_label(action);
+        }
+        *self.toast_command.borrow_mut() = command;
+        util::reveal(&self.toast);
+        self.toast_button.set_visible(action.is_some());
+        let sequence = self.toast_seq.get() + 1;
+        self.toast_seq.set(sequence);
+        let weak = self.this.clone();
+        glib::timeout_add_seconds_local(4, move || {
+            if let Some(browser) = weak.upgrade() {
+                if browser.toast_seq.get() == sequence {
+                    browser.toast.hide();
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn run_js(&self, view: &WebView, script: &str) {
+        view.evaluate_javascript(
+            script,
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            |_result| {},
+        );
+    }
+
+    fn inject_css(&self, view: &WebView, id: &str, css: &str) {
+        let id_literal = serde_json::to_string(id).unwrap_or_else(|_| "\"search\"".into());
+        let css_literal = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".into());
+        let script = format!(
+            "(function(){{var id={id};var css={css};var s=document.getElementById(id);if(!s){{s=document.createElement('style');s.id=id;(document.head||document.documentElement).appendChild(s);}}s.textContent=css;}})();",
+            id = id_literal,
+            css = css_literal
+        );
+        self.run_js(view, &script);
+    }
+
+    fn apply_veils_to_active(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (kind, host, view) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (
+                tab.kind,
+                store::bare_host(&tab.url),
+                tab.view.clone(),
+            )
+        };
+        if kind != PageKind::Web || host.is_empty() {
+            return;
+        }
+        let css = self.curtain.borrow().css(&host, None);
+        self.inject_css(&view, "search-veils", &css);
+    }
+
+    fn apply_page_scripts(self: &Rc<Self>, index: usize) {
+        let (kind, host, view, darken) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (
+                tab.kind,
+                store::bare_host(&tab.url),
+                tab.view.clone(),
+                self.prefs.borrow().darken_pages,
+            )
+        };
+        if kind != PageKind::Web {
+            return;
+        }
+        let css = self.curtain.borrow().css(&host, None);
+        if !css.is_empty() {
+            self.inject_css(&view, "search-veils", &css);
+        }
+        if darken {
+            self.run_js(&view, DARKEN_SCRIPT);
+        }
+    }
+
+    fn start_veil_picker(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (kind, view) = {
+            let tabs = self.tabs.borrow();
+            (tabs[index].kind, tabs[index].view.clone())
+        };
+        if kind != PageKind::Web {
+            self.toast("Hide works on a page, not on one of Search's own");
+            return;
+        }
+        self.run_js(&view, VEIL_PICKER_SCRIPT);
+        self.toast("Click what you would rather not see");
+    }
+
+    fn toggle_reader(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (kind, reading, view) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (tab.kind, tab.reader, tab.view.clone())
+        };
+        if kind != PageKind::Web {
+            self.toast("Reading mode is for pages, not for Search's own");
+            return;
+        }
+        if reading {
+            self.tabs.borrow_mut()[index].reader = false;
+            view.reload();
+            return;
+        }
+        let follows = self.prefs.borrow().reader_follows_look;
+        let dark = follows && self.prefers_dark();
+        let script = format!(
+            "window.__searchReaderDark = {};\n{}",
+            if dark { "true" } else { "false" },
+            READER_SCRIPT
+        );
+        self.tabs.borrow_mut()[index].reader = true;
+        self.run_js(&view, &script);
+    }
+
+    fn prefers_dark(&self) -> bool {
+        match self.prefs.borrow().look.as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => util::system_prefers_dark(),
+        }
+    }
+
+    fn reload_if_kind(self: &Rc<Self>, kinds: &[PageKind]) {
+        if let Some(index) = self.active_index() {
+            let (kind, uri) = {
+                let tabs = self.tabs.borrow();
+                (tabs[index].kind, tabs[index].url.clone())
+            };
+            if kinds.contains(&kind) && !uri.is_empty() {
+                self.tabs.borrow()[index].view.load_uri(&uri);
+            }
+        }
+    }
+}
+
+fn first_letter(pin: &str, title: &str) -> String {
+    pin.chars()
+        .chain(title.chars())
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "•".into())
+}
+
+/// How many pins go in each row of the column: at most `most`, and as even
+/// as they go, the fuller rows first (Search's SideBar.pinRows).
+fn pin_rows(count: usize, most: usize) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let most = most.max(1);
+    let rows = count.div_ceil(most);
+    let base = count / rows;
+    let extra = count % rows;
+    (0..rows).map(|row| if row < extra { base + 1 } else { base }).collect()
+}
+
+/// The small cross at the end of a tab. It keeps its place whatever the
+/// pointer does, and is only seen while the pointer is on the tab.
+fn close_button() -> gtk::Button {
+    let close = gtk::Button::new();
+    close.set_relief(gtk::ReliefStyle::None);
+    close.style_context().add_class("tab-close");
+    close.set_size_request(15, 15);
+    close.set_valign(gtk::Align::Center);
+    let label = gtk::Label::new(Some("×"));
+    label.set_halign(gtk::Align::Center);
+    label.set_valign(gtk::Align::Center);
+    label.style_context().add_class("tab-close-glyph");
+    close.add(&label);
+    close.set_opacity(1.0);
+    close.set_sensitive(true);
+    // Keep the row/strip from treating a click on the cross as a click
+    // on the tab itself.
+    close.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+    close.connect_button_press_event(|_, _| glib::Propagation::Proceed);
+    close
+}
+
+/// The quiet row under the tabs that makes another.
+fn new_tab_row() -> gtk::EventBox {
+    let event = gtk::EventBox::new();
+    event.set_visible_window(true);
+    event.style_context().add_class("new-tab-row");
+    event.set_size_request(-1, 28);
+    event.set_tooltip_text(Some("New tab — Ctrl+T"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.set_margin_start(10);
+    row.set_margin_end(7);
+    let plus = util::image_icon("list-add-symbolic", 14);
+    plus.set_valign(gtk::Align::Center);
+    row.pack_start(&plus, false, false, 0);
+    let label = util::label("New tab", Some("new-tab-label"));
+    label.set_valign(gtk::Align::Center);
+    row.pack_start(&label, true, true, 0);
+    event.add(&row);
+    event
+}
+
+// ---------------------------------------------------------------- omnibox
+
+impl Browser {
+    fn open_omni(self: &Rc<Self>) {
+        let text = match self.active_index() {
+            Some(index) => {
+                let tabs = self.tabs.borrow();
+                let tab = &tabs[index];
+                if tab.kind == PageKind::Web {
+                    store::editable_url(&tab.url)
+                } else {
+                    String::new()
+                }
+            }
+            None => String::new(),
+        };
+        self.omni.entry.set_text(&text);
+        self.omni.layer.show();
+        util::reveal(&self.omni.card);
+        self.refresh_suggestions();
+        self.omni.entry.grab_focus();
+        self.omni.entry.select_region(0, -1);
+    }
+
+    fn list_tabs(self: &Rc<Self>) {
+        self.open_omni();
+        self.omni.entry.set_text("#");
+        self.refresh_suggestions();
+    }
+
+    fn close_omni(self: &Rc<Self>) {
+        if !self.omni.open.get() && !self.omni.card.is_visible() {
+            return;
+        }
+        self.omni.open.set(false);
+        self.omni.card.hide();
+        self.omni.layer.hide();
+        if let Some(view) = self.active_view() {
+            view.grab_focus();
+        }
+    }
+
+    fn refresh_suggestions(self: &Rc<Self>) {
+        while let Some(child) = self.omni.list.children().first().cloned() {
+            self.omni.list.remove(&child);
+        }
+        self.omni.rows.borrow_mut().clear();
+        self.omni.items.borrow_mut().clear();
+
+        let typed = self.omni.entry.text().to_string();
+        let mut items: Vec<Suggestion> = Vec::new();
+        let hosts = self.active_host();
+        let (fills, engine, custom) = {
+            let prefs = self.prefs.borrow();
+            (
+                prefs.fills_passwords,
+                prefs.engine.clone(),
+                prefs.custom_engine.clone(),
+            )
+        };
+
+        let listing_tabs = typed.starts_with('#');
+        if listing_tabs {
+            let filter = typed[1..].trim().to_lowercase();
+            for tab in self.tabs.borrow().iter() {
+                let title = tab.display_title();
+                if !filter.is_empty() && !title.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                items.push(Suggestion {
+                    title,
+                    detail: if tab.url.is_empty() { "Open tab".into() } else { store::pretty_url(&tab.url) },
+                    url: tab.url.clone(),
+                    kind: "tab",
+                    letter: letter_of(&tab.display_title(), &tab.url),
+                });
+            }
+        } else if typed.trim().is_empty() {
+            for visit in self.history.borrow().recent(6) {
+                let detail = store::pretty_url(&visit.url);
+                items.push(Suggestion {
+                    title: if visit.title.trim().is_empty() {
+                        detail.clone()
+                    } else {
+                        visit.title.clone()
+                    },
+                    detail,
+                    url: visit.url.clone(),
+                    kind: "history",
+                    letter: letter_of(&visit.title, &visit.url),
+                });
+            }
+        } else {
+            let target = typed.trim();
+            let looks = store::looks_like_url(target);
+            let engine_name = store::engine_name(&engine, &custom);
+            let search = Suggestion {
+                title: if looks {
+                    format!("Go to {}", target)
+                } else {
+                    format!("Search {} for “{}”", engine_name, target)
+                },
+                detail: if looks {
+                    "Address".into()
+                } else {
+                    format!("{} · press Enter", engine_name)
+                },
+                url: target.to_string(),
+                kind: "search",
+                letter: if looks { "→".into() } else { "⌕".into() },
+            };
+
+            // Only an exact command name goes first, so Enter always runs what
+            // the reader typed in full. Partial matches still appear below the
+            // search row, where the arrow keys can reach them.
+            let mut hits = palette_hits(target);
+            let command_first = hits.first().map(|(score, _)| *score >= 100).unwrap_or(false);
+            if command_first {
+                if let Some((_, suggestion)) = hits.first() {
+                    items.push(suggestion.clone());
+                }
+                items.push(search);
+                if !hits.is_empty() {
+                    hits.remove(0);
+                }
+                items.extend(hits.into_iter().map(|(_, suggestion)| suggestion));
+            } else {
+                items.push(search);
+                items.extend(hits.into_iter().map(|(_, suggestion)| suggestion));
+            }
+
+            // The command list covers the named internal pages. Keep the
+            // generic place row for an address typed out in full.
+            if let Some(place) = self.instant_place(target) {
+                if target.to_lowercase().starts_with("search://") {
+                    let kind = kind_for(&place);
+                    items.push(Suggestion {
+                        title: kind.title().to_string(),
+                        detail: place.clone(),
+                        url: place,
+                        kind: "place",
+                        letter: "◈".into(),
+                    });
+                }
+            }
+
+            for visit in self.history.borrow().suggest(target, 4) {
+                if items.iter().any(|item| item.url == visit.url) {
+                    continue;
+                }
+                let detail = store::pretty_url(&visit.url);
+                items.push(Suggestion {
+                    title: if visit.title.trim().is_empty() {
+                        detail.clone()
+                    } else {
+                        visit.title.clone()
+                    },
+                    detail,
+                    url: visit.url.clone(),
+                    kind: "history",
+                    letter: letter_of(&visit.title, &visit.url),
+                });
+            }
+            for bookmark in self.bookmarks.borrow().suggest(target, 3) {
+                let url = bookmark.url.clone().unwrap_or_default();
+                if url.is_empty() || items.iter().any(|item| item.url == url) {
+                    continue;
+                }
+                let detail = store::pretty_url(&url);
+                items.push(Suggestion {
+                    title: bookmark.label(),
+                    detail,
+                    url,
+                    kind: "bookmark",
+                    letter: letter_of(&bookmark.label(), ""),
+                });
+            }
+            let lower = target.to_lowercase();
+            let mut tab_hits = 0;
+            for tab in self.tabs.borrow().iter() {
+                if tab_hits >= 2 || tab.url.is_empty() || tab.kind != PageKind::Web {
+                    continue;
+                }
+                let hay = format!("{} {}", tab.display_title(), tab.url).to_lowercase();
+                if !hay.contains(&lower) {
+                    continue;
+                }
+                if items.iter().any(|item| item.url == tab.url) {
+                    continue;
+                }
+                items.push(Suggestion {
+                    title: tab.display_title(),
+                    detail: "Open tab".into(),
+                    url: tab.url.clone(),
+                    kind: "tab",
+                    letter: letter_of(&tab.display_title(), &tab.url),
+                });
+                tab_hits += 1;
+            }
+            if fills && !hosts.is_empty() {
+                for login in self.vault.borrow().for_host(&hosts) {
+                    let user = if login.user.is_empty() {
+                        "(no account name)".to_string()
+                    } else {
+                        login.user.clone()
+                    };
+                    items.push(Suggestion {
+                        title: user,
+                        detail: format!("Password for {}", hosts),
+                        url: format!("{}|{}", hosts, login.user),
+                        kind: "password",
+                        letter: "⚿".into(),
+                    });
+                }
+            }
+        }
+
+        items.truncate(10);
+        let selected = 0usize;
+        self.omni.selected.set(selected);
+        *self.omni.items.borrow_mut() = items.clone();
+        self.omni.open.set(true);
+
+        if items.is_empty() {
+            self.omni.list.show_all();
+            return;
+        }
+        for (index, suggestion) in items.iter().enumerate() {
+            let button = gtk::Button::new();
+            button.set_relief(gtk::ReliefStyle::None);
+            button.style_context().add_class("omnibox-row");
+            if index == selected {
+                button.style_context().add_class("picked");
+            }
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            let letter = util::label(&suggestion.letter, Some("suggestion-icon"));
+            letter.set_width_chars(2);
+            letter.set_xalign(0.5);
+            row.pack_start(&letter, false, false, 0);
+            let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            words.set_hexpand(true);
+            let title = util::label(&suggestion.title, Some("suggestion-title"));
+            title.set_max_width_chars(62);
+            let detail = util::label(&suggestion.detail, Some("suggestion-kind"));
+            detail.set_max_width_chars(62);
+            words.pack_start(&title, false, false, 0);
+            words.pack_start(&detail, false, false, 0);
+            row.pack_start(&words, true, true, 0);
+            let kind = util::label(
+                match suggestion.kind {
+                    "history" => "History",
+                    "bookmark" => "Bookmark",
+                    "tab" => "Tab",
+                    "password" => "Password",
+                    "place" => "Search",
+                    "command" => "Action",
+                    "setting" => "Settings",
+                    _ => "",
+                },
+                Some("suggestion-kind"),
+            );
+            row.pack_start(&kind, false, false, 0);
+            button.add(&row);
+            let weak = self.this.clone();
+            button.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.activate_suggestion(index, false);
+                }
+            });
+            self.omni.list.pack_start(&button, false, false, 0);
+            self.omni.rows.borrow_mut().push(button.upcast::<gtk::Widget>());
+        }
+        self.omni.list.show_all();
+    }
+
+    fn move_omni_selection(self: &Rc<Self>, delta: i32) {
+        let count = self.omni.items.borrow().len();
+        if count == 0 {
+            return;
+        }
+        let current = self.omni.selected.get() as i32;
+        let next = (current + delta).rem_euclid(count as i32) as usize;
+        self.omni.selected.set(next);
+        for (index, row) in self.omni.rows.borrow().iter().enumerate() {
+            let context = row.style_context();
+            if index == next {
+                context.add_class("picked");
+            } else {
+                context.remove_class("picked");
+            }
+        }
+        let scroll = self.omni.scroll.vadjustment();
+        if let Some(row) = self.omni.rows.borrow().get(next).cloned() {
+            let height = row.allocated_height();
+            let value = scroll.value();
+            let page = scroll.page_size();
+            if (row.allocation().y() as f64) < value {
+                scroll.set_value(row.allocation().y() as f64);
+            } else if (row.allocation().y() + height) as f64 > value + page {
+                scroll.set_value((row.allocation().y() + height) as f64 - page);
+            }
+        }
+    }
+
+    fn submit_omni(self: &Rc<Self>, alternate: bool) {
+        let text = self.omni.entry.text().to_string();
+        if text.trim().is_empty() {
+            self.close_omni();
+            return;
+        }
+        let selected = self.omni.selected.get();
+        let count = self.omni.items.borrow().len();
+        if count == 0 {
+            self.close_omni();
+            self.go_typed(&text, alternate);
+            return;
+        }
+        // The first row is no longer always a search: an exact command takes
+        // its place, and it must run on Enter just like a clicked row.
+        self.activate_suggestion(selected.min(count - 1), alternate);
+    }
+
+    fn activate_suggestion(self: &Rc<Self>, index: usize, alternate: bool) {
+        let suggestion = self.omni.items.borrow().get(index).cloned();
+        let Some(suggestion) = suggestion else {
+            return;
+        };
+        match suggestion.kind {
+            "search" => {
+                let text = self.omni.entry.text().to_string();
+                self.close_omni();
+                self.go_typed(&text, alternate);
+            }
+            "command" => {
+                self.close_omni();
+                match suggestion.url.as_str() {
+                    "new-tab" => self.new_tab(None, false),
+                    "new-private" => self.new_tab(None, true),
+                    "reader" => self.toggle_reader(),
+                    "split" => self.toggle_split(),
+                    "find" => self.open_find(),
+                    "settings" => self.go_internal("settings"),
+                    "history" => self.go_internal("history"),
+                    "bookmarks" => self.go_internal("bookmarks"),
+                    "downloads" => self.go_internal("downloads"),
+                    "passwords" => self.go_internal("passwords"),
+                    "hidden" => self.go_internal("hidden"),
+                    _ => {}
+                }
+            }
+            "setting" => {
+                self.close_omni();
+                self.go_internal(&format!("settings?tab={}", suggestion.url));
+            }
+            "tab" => {
+                self.close_omni();
+                let url = suggestion.url.clone();
+                if let Some(index) = self.tabs.borrow().iter().position(|tab| tab.url == url && !url.is_empty()) {
+                    self.switch_to(index);
+                } else if let Some(index) = self.tabs.borrow().iter().position(|tab| tab.display_title() == suggestion.title) {
+                    self.switch_to(index);
+                }
+            }
+            "password" => {
+                if let Some((host, user)) = suggestion.url.split_once('|') {
+                    let host = host.to_string();
+                    let user = user.to_string();
+                    self.close_omni();
+                    self.fill_login(&host, &user);
+                }
+            }
+            _ => {
+                self.close_omni();
+                self.navigate(&suggestion.url);
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------- find
+
+impl Browser {
+    fn open_find(self: &Rc<Self>) {
+        util::reveal(&self.find_card);
+        self.find_status.set_text("");
+        self.find_entry.grab_focus();
+        self.find_entry.select_region(0, -1);
+        let text = self.find_entry.text().to_string();
+        if !text.trim().is_empty() {
+            self.find_search(&text, false);
+        }
+    }
+
+    fn close_find(self: &Rc<Self>) {
+        if let Some(view) = self.active_view() {
+            if let Some(controller) = view.find_controller() {
+                controller.search_finish();
+            }
+            view.grab_focus();
+        }
+        self.find_status.set_text("");
+        self.find_card.hide();
+    }
+
+    fn find_search(self: &Rc<Self>, text: &str, backwards: bool) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let Some(controller) = view.find_controller() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            controller.search("", FindOptions::NONE.bits(), 0);
+            self.find_status.set_text("");
+            return;
+        }
+        let mut options = FindOptions::CASE_INSENSITIVE | FindOptions::WRAP_AROUND;
+        if backwards {
+            options |= FindOptions::BACKWARDS;
+        }
+        controller.search(text, options.bits(), u32::MAX);
+    }
+
+    fn find_next(self: &Rc<Self>, backwards: bool) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let Some(controller) = view.find_controller() else {
+            return;
+        };
+        let text = self.find_entry.text().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        if backwards {
+            controller.search_previous();
+        } else {
+            controller.search_next();
+        }
+    }
+}
+
+fn letter_of(title: &str, url: &str) -> String {
+    title
+        .chars()
+        .chain(url.chars())
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "•".into())
+}
+
+// Matching is deliberately forgiving: lower case, no accents, and singular
+// words, so "pestañas", "pestanas" and "pestaña" all reach the same command.
+fn fold_match(text: &str) -> String {
+    let folded: String = text
+        .chars()
+        .flat_map(|c| {
+            let plain = match c {
+                'á' | 'à' | 'ä' | 'â' | 'ã' | 'å' => 'a',
+                'é' | 'è' | 'ë' | 'ê' => 'e',
+                'í' | 'ì' | 'ï' | 'î' => 'i',
+                'ó' | 'ò' | 'ö' | 'ô' | 'õ' => 'o',
+                'ú' | 'ù' | 'ü' | 'û' => 'u',
+                'ñ' => 'n',
+                'ç' => 'c',
+                _ => c,
+            };
+            plain.to_lowercase()
+        })
+        .collect();
+    folded
+        .split_whitespace()
+        .map(|word| {
+            let length = word.chars().count();
+            if length > 3 && word.ends_with('s') {
+                word[..word.len() - 1].to_string()
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn palette_score(query: &str, item: &PaletteItem) -> Option<i32> {
+    let query = fold_match(query);
+    if query.chars().count() < 2 {
+        return None;
+    }
+    let mut best = 0;
+    let mut consider = |candidate: &str| {
+        let hay = fold_match(candidate);
+        let score = if hay == query {
+            100
+        } else if hay.starts_with(&query) {
+            85
+        } else if hay.split_whitespace().any(|word| word.starts_with(&query)) {
+            70
+        } else if query.chars().count() >= 3 && hay.contains(&query) {
+            55
+        } else if query
+            .split_whitespace()
+            .all(|word| hay.split_whitespace().any(|hay_word| hay_word.starts_with(word)))
+        {
+            45
+        } else {
+            0
+        };
+        best = best.max(score);
+    };
+    consider(item.title);
+    for alias in item.aliases {
+        consider(alias);
+    }
+    if best > 0 { Some(best) } else { None }
+}
+
+// Settings rows carry their section in the detail, e.g. "Settings · Privacy";
+// the settings page wants just "privacy" in its tab query.
+fn palette_section(detail: &str) -> String {
+    detail
+        .rsplit('·')
+        .next()
+        .unwrap_or(detail)
+        .trim()
+        .to_lowercase()
+}
+
+fn palette_hits(query: &str) -> Vec<(i32, Suggestion)> {
+    let mut hits: Vec<(i32, &PaletteItem)> = PALETTE
+        .iter()
+        .filter_map(|item| palette_score(query, item).map(|score| (score, item)))
+        .collect();
+    // Stable by score: on a tie, the order of PALETTE keeps actions such as
+    // "New tab" ahead of the settings rows that mention the same word.
+    hits.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    hits.truncate(6);
+    hits.into_iter()
+        .map(|(score, item)| {
+            (
+                score,
+                Suggestion {
+                    title: item.title.to_string(),
+                    detail: item.detail.to_string(),
+                    url: if item.kind == "setting" {
+                        palette_section(item.detail)
+                    } else {
+                        item.target.to_string()
+                    },
+                    kind: item.kind,
+                    letter: item.letter.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------ page content
+
+impl Browser {
+    fn page_html(&self, uri: &str) -> String {
+        let kind = pages::page_kind_for_url(uri).unwrap_or(PageKind::Blank);
+        let prefs = self.prefs.borrow();
+        match kind {
+            PageKind::Settings => {
+                let section = url::Url::parse(uri)
+                    .ok()
+                    .and_then(|parsed| {
+                        parsed
+                            .query_pairs()
+                            .find(|(key, _)| key == "tab")
+                            .map(|(_, value)| value.to_string())
+                    })
+                    .filter(|value| {
+                        matches!(
+                            value.as_str(),
+                            "general"
+                                | "appearance"
+                                | "tabs"
+                                | "browsing"
+                                | "privacy"
+                                | "passwords"
+                                | "about"
+                        )
+                    })
+                    .unwrap_or_else(|| "general".into());
+                pages::settings(&prefs, &self.vault.borrow(), &section)
+            }
+            PageKind::History => pages::history(&self.history.borrow(), &prefs),
+            PageKind::Bookmarks => pages::bookmarks(&self.bookmarks.borrow(), &prefs),
+            PageKind::Downloads => {
+                let views = self.download_views();
+                pages::downloads(&views, &prefs)
+            }
+            PageKind::Passwords => pages::passwords(&self.vault.borrow(), &prefs),
+            PageKind::Hidden => {
+                let host = self.hidden_host();
+                pages::hidden(&self.curtain.borrow(), &host, &prefs)
+            }
+            PageKind::Welcome => pages::welcome(&prefs),
+            PageKind::Blank => pages::blank(&prefs),
+            PageKind::Web => pages::blank(&prefs),
+        }
+    }
+
+    fn hidden_host(&self) -> String {
+        if let Some(index) = self.active_index() {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            if tab.kind == PageKind::Web {
+                let host = store::bare_host(&tab.url);
+                if !host.is_empty() {
+                    return host;
+                }
+            }
+        }
+        self.last_host.borrow().clone()
+    }
+
+    fn go_internal(self: &Rc<Self>, page: &str) {
+        let Some(url) = internal_url_for(page) else {
+            self.toast("That page is not one of Search's");
+            return;
+        };
+        let kind = kind_for(&url);
+        // Find the tab first and release the borrow: navigating and switching
+        // need mutable access to the same list.
+        let existing = self
+            .tabs
+            .borrow()
+            .iter()
+            .position(|tab| tab.kind == kind && kind.internal());
+        if let Some(index) = existing {
+            if self.tabs.borrow()[index].url != url {
+                self.navigate_in(index, &url);
+            }
+            self.switch_to(index);
+            return;
+        }
+        let active = self.active_index();
+        if let Some(index) = active {
+            let (current, private) = {
+                let tabs = self.tabs.borrow();
+                let tab = &tabs[index];
+                (tab.kind, tab.private)
+            };
+            if !private && (current.internal() || current == PageKind::Blank) {
+                self.navigate_in(index, &url);
+                return;
+            }
+        }
+        self.add_tab(Some(&url), false, true, None, None, None, false);
+    }
+}
+
+fn internal_url_for(page: &str) -> Option<String> {
+    let page = page.trim();
+    if page.starts_with("search://") {
+        return Some(page.to_string());
+    }
+    let (base, query) = match page.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (page, None),
+    };
+    match base {
+        "settings" => Some(match query {
+            Some(query) if !query.is_empty() => format!("search://settings?{}", query),
+            _ => "search://settings".into(),
+        }),
+        "settings-password" | "settings-passwords" => {
+            Some("search://settings?tab=passwords".into())
+        }
+        "history" => Some("search://history".into()),
+        "bookmarks" => Some("search://bookmarks".into()),
+        "downloads" => Some("search://downloads".into()),
+        "passwords" => Some("search://passwords".into()),
+        "hidden" => Some("search://hidden".into()),
+        "welcome" => Some("search://welcome".into()),
+        "blank" | "new" => Some("search://blank".into()),
+        _ => None,
+    }
+}
+
+// ----------------------------------------------------------------- messages
+
+impl Browser {
+    fn handle_message(self: &Rc<Self>, id: u64, text: &str) {
+        let Some(value) = store::parse_json(text) else {
+            return;
+        };
+        let string = |key: &str| {
+            value
+                .get(key)
+                .and_then(|field| field.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let Some(action) = value.get("action").and_then(|field| field.as_str()) else {
+            return;
+        };
+        match action {
+            "ptr" => {
+                let active_id = self
+                    .tabs
+                    .borrow()
+                    .get(self.active.get())
+                    .map(|tab| tab.id);
+                if active_id == Some(id) {
+                    let x = value.get("x").and_then(|field| field.as_f64());
+                    let y = value.get("y").and_then(|field| field.as_f64());
+                    if let (Some(x), Some(y)) = (x, y) {
+                        let view = self.tabs.borrow()[self.active.get()].view.clone();
+                        if let Some((ox, oy)) = view.translate_coordinates(&self.window, 0, 0) {
+                            self.pointer_moved(ox as f64 + x, oy as f64 + y);
+                        }
+                    }
+                }
+            }
+            "escape" => {
+                if self.omni.card.is_visible() {
+                    self.close_omni();
+                } else if self.find_card.is_visible() {
+                    self.close_find();
+                }
+            }
+            "go" => {
+                let page = string("page");
+                if !page.is_empty() {
+                    self.go_internal(&page);
+                }
+            }
+            "open" => {
+                let url = string("url");
+                if !url.is_empty() {
+                    self.navigate_in_by_id(id, &url);
+                }
+            }
+            "setting" | "choice" => {
+                let key = string("key");
+                let value = value
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                if !key.is_empty() {
+                    self.set_setting(&key, value);
+                }
+            }
+            "welcome-done" => {
+                self.prefs.borrow_mut().has_welcomed = true;
+                self.prefs.borrow().save();
+                self.navigate_in_by_id(id, "search://blank");
+                self.open_omni();
+            }
+            "bookmark-here" => self.bookmark_here(),
+            "bookmark-delete" => {
+                let bookmark = string("id");
+                if self.bookmarks.borrow_mut().remove(&bookmark) {
+                    self.rebuild_bookmarks_bar();
+                    self.refresh_kind(PageKind::Bookmarks);
+                    self.toast("Removed");
+                }
+            }
+            "bookmark-rename" => {
+                let bookmark = string("id");
+                let current = self
+                    .bookmarks
+                    .borrow()
+                    .all()
+                    .find(|node| node.id == bookmark)
+                    .map(|node| node.label())
+                    .unwrap_or_default();
+                if let Some(title) = self.prompt("Rename Bookmark", "A name for this page.", &current)
+                {
+                    self.bookmarks.borrow_mut().rename(&bookmark, title.trim());
+                    self.rebuild_bookmarks_bar();
+                    self.refresh_kind(PageKind::Bookmarks);
+                }
+            }
+            "bookmark-folder" => {
+                if let Some(title) = self.prompt("New Folder", "What to call it.", "") {
+                    if !title.trim().is_empty() {
+                        self.bookmarks.borrow_mut().add_folder(title.trim());
+                        self.rebuild_bookmarks_bar();
+                        self.refresh_kind(PageKind::Bookmarks);
+                    }
+                }
+            }
+            "history-delete" => {
+                let url = string("url");
+                self.history.borrow_mut().remove(&url);
+                self.refresh_kind(PageKind::History);
+            }
+            "history-clear" | "clear-history" => {
+                if self.confirm("Clear History?", "Every address Search remembers, gone.") {
+                    self.history.borrow_mut().clear();
+                    self.refresh_kind(PageKind::History);
+                    self.refresh_kind(PageKind::Settings);
+                    self.toast("History cleared");
+                }
+            }
+            "clear-cache" => {
+                if self.confirm("Clear the Cache?", "Fetched files will be downloaded again as needed.") {
+                    self.clear_site_data(webkit2gtk::WebsiteDataTypes::MEMORY_CACHE
+                        | webkit2gtk::WebsiteDataTypes::DISK_CACHE);
+                    self.toast("Cache cleared");
+                }
+            }
+            "clear-sites" => {
+                if self.confirm(
+                    "Sign Out of Everything?",
+                    "Cookies, storage and cached sign-ins on every site are forgotten.",
+                ) {
+                    self.clear_site_data(webkit2gtk::WebsiteDataTypes::ALL);
+                    self.toast("Signed out everywhere");
+                }
+            }
+            "choose-downloads" => self.choose_downloads_folder(),
+            "shield-resume" => {
+                let host = string("host");
+                if !host.is_empty() {
+                    self.prefs.borrow_mut().pause_shield(&host, false);
+                    self.tune_all();
+                    self.refresh_kind(PageKind::Settings);
+                    self.reload_active();
+                    self.toast("uBlock filters are on");
+                }
+            }
+            "downloads-clear" => {
+                self.downloads
+                    .borrow_mut()
+                    .retain(|record| record.view.state == "Downloading");
+                self.refresh_downloads_page();
+                self.toast("Finished downloads cleared");
+            }
+            "download-open" => {
+                let path = string("path");
+                self.open_download(&path);
+            }
+            "download-reveal" => {
+                let path = string("path");
+                self.reveal_download(&path);
+            }
+            "download-cancel" => {
+                let index = value
+                    .get("index")
+                    .and_then(|field| field.as_str())
+                    .and_then(|field| field.parse::<usize>().ok())
+                    .or_else(|| {
+                        value
+                            .get("index")
+                            .and_then(|field| field.as_u64())
+                            .map(|field| field as usize)
+                    });
+                if let Some(index) = index {
+                    self.cancel_download(index);
+                }
+            }
+            "password-show" => {
+                let host = string("host");
+                let user = string("user");
+                self.reveal_password(&host, &user);
+            }
+            "password-fill" => {
+                let host = string("host");
+                let user = string("user");
+                self.fill_login(&host, &user);
+            }
+            "password-delete" => {
+                let host = string("host");
+                let user = string("user");
+                if self.confirm(
+                    "Remove Password?",
+                    &format!("The sign-in for {} will be forgotten.", host),
+                ) {
+                    self.vault.borrow_mut().forget(&host, &user);
+                    self.vault.borrow_mut().save();
+                    self.refresh_kind(PageKind::Passwords);
+                    self.toast("Password removed");
+                }
+            }
+            "password-capture" => {
+                let host = string("host");
+                let user = string("user");
+                let password = string("password");
+                self.capture_login(&host, &user, &password);
+            }
+            "veil-pick" => {
+                let selector = string("selector");
+                let label = string("label");
+                self.hide_element(id, &selector, &label);
+            }
+            "veil-restore" => {
+                let host = string("host");
+                let selector = string("value");
+                self.curtain.borrow_mut().restore(&host, &selector);
+                self.apply_veils_to_active();
+                self.refresh_kind(PageKind::Hidden);
+            }
+            "veil-restore-all" => {
+                let host = string("host");
+                self.curtain.borrow_mut().restore_all(&host);
+                self.apply_veils_to_active();
+                self.refresh_kind(PageKind::Hidden);
+                self.toast("Everything is back");
+            }
+            "veil-undo" => {
+                let host = string("host");
+                self.curtain.borrow_mut().undo(&host);
+                self.apply_veils_to_active();
+                self.refresh_kind(PageKind::Hidden);
+                self.toast("Put back");
+            }
+            _ => {}
+        }
+    }
+
+    fn navigate_in_by_id(self: &Rc<Self>, id: u64, url: &str) {
+        if let Some(index) = self.index_of(id) {
+            self.navigate_in(index, url);
+        } else {
+            self.navigate(url);
+        }
+    }
+
+    fn bookmark_here(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (kind, url, title) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (tab.kind, tab.url.clone(), tab.display_title())
+        };
+        if kind != PageKind::Web || url.is_empty() {
+            self.toast("Open a page first");
+            return;
+        }
+        if self.bookmarks.borrow().contains(&url) {
+            self.toast("Already kept");
+            return;
+        }
+        self.bookmarks.borrow_mut().add(&url, &title);
+        self.rebuild_bookmarks_bar();
+        self.refresh_kind(PageKind::Bookmarks);
+        self.toast("Kept");
+    }
+
+    fn hide_element(self: &Rc<Self>, id: u64, selector: &str, label: &str) {
+        if selector.trim().is_empty() {
+            return;
+        }
+        let host = match self.index_of(id) {
+            Some(index) => store::bare_host(&self.tabs.borrow()[index].url),
+            None => String::new(),
+        };
+        let host = if host.is_empty() {
+            self.hidden_host()
+        } else {
+            host
+        };
+        if host.is_empty() {
+            return;
+        }
+        let already = self
+            .curtain
+            .borrow()
+            .veils(&host)
+            .iter()
+            .any(|veil| veil.selector == selector);
+        if already {
+            self.toast("That is already hidden");
+            return;
+        }
+        self.curtain
+            .borrow_mut()
+            .hide(&host, selector, label, "Hidden from the page");
+        self.apply_veils_to_active();
+        self.refresh_kind(PageKind::Hidden);
+        self.show_toast(
+            "Hidden",
+            Some("Undo"),
+            Some(ToastCommand::UndoVeil(host)),
+        );
+    }
+
+    fn refresh_kind(&self, kind: PageKind) {
+        let views: Vec<WebView> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| tab.kind == kind && !tab.url.is_empty())
+            .map(|tab| tab.view.clone())
+            .collect();
+        for view in views {
+            view.reload();
+        }
+    }
+}
+
+// ----------------------------------------------------------------- settings
+
+impl Browser {
+    fn set_setting(self: &Rc<Self>, key: &str, value: serde_json::Value) {
+        let boolean = value.as_bool().unwrap_or(false);
+        let text = match &value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Number(number) => number.to_string(),
+            serde_json::Value::Bool(flag) => flag.to_string(),
+            _ => String::new(),
+        };
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            match key {
+                "engine" => prefs.engine = text,
+                "custom_engine" => prefs.custom_engine = text,
+                "shift_engine" => prefs.shift_engine = text,
+                "shift_custom" => prefs.shift_custom = text,
+                "look" => prefs.look = text,
+                "glyph" => prefs.glyph = text,
+                "sidebar" => prefs.sidebar = boolean,
+                "auto_hide_sidebar" => prefs.auto_hide_sidebar = boolean,
+                "side_position_right" => {
+                    prefs.side_position = if boolean { "right".into() } else { "left".into() }
+                }
+                "cards" => prefs.cards = boolean,
+                "bookmarks_bar" => prefs.bookmarks_bar = boolean,
+                "compact_strip" => prefs.compact_strip = boolean,
+                "roomy_tabs" => prefs.roomy_tabs = boolean,
+                "show_tab_shortcuts" => prefs.show_tab_shortcuts = boolean,
+                "show_reading" => prefs.show_reading = boolean,
+                "new_tab_place" => {
+                    prefs.new_tab_place = text
+                        .parse::<i32>()
+                        .or_else(|_| value.as_i64().map(|n| n as i32).ok_or(()))
+                        .unwrap_or(0)
+                }
+                "split_view" => prefs.split_view = boolean,
+                "reduce_motion" => prefs.reduce_motion = boolean,
+                "adblock" => prefs.adblock = boolean,
+                "darken_pages" => prefs.darken_pages = boolean,
+                "reader_follows_look" => prefs.reader_follows_look = boolean,
+                "waits_for_play" => prefs.waits_for_play = boolean,
+                "show_links" => prefs.show_links = boolean,
+                "developer_extras" => prefs.developer_extras = boolean,
+                "saves_passwords" => prefs.saves_passwords = boolean,
+                "fills_passwords" => prefs.fills_passwords = boolean,
+                "keeps_signins" => prefs.keeps_signins = boolean,
+                "keep_session_data" => prefs.keep_session_data = boolean,
+                "restore_session" => prefs.restore_session = boolean,
+                "start_fresh" => prefs.start_fresh = boolean,
+                "confirm_quit" => prefs.confirm_quit = boolean,
+                "ask_downloads" => prefs.ask_downloads = boolean,
+                "keeps_sites_awake" => prefs.keeps_sites_awake = boolean,
+                "sleep_tabs" => prefs.sleep_tabs = boolean,
+                _ => {}
+            }
+            prefs.save();
+        }
+
+        match key {
+            "look" => self.apply_look(),
+            "sidebar" | "side_position_right" | "cards" | "roomy_tabs" | "glyph"
+            | "show_tab_shortcuts" | "bookmarks_bar" | "compact_strip"
+            | "auto_hide_sidebar" => {
+                self.apply_layout();
+                self.rebuild_tabs();
+                self.refresh_header();
+            }
+            "adblock" => {
+                self.tune_all();
+                if self
+                    .active_index()
+                    .map(|index| self.tabs.borrow()[index].kind == PageKind::Web)
+                    .unwrap_or(false)
+                {
+                    self.reload_active();
+                }
+            }
+            "darken_pages" | "reader_follows_look" => {
+                if self
+                    .active_index()
+                    .map(|index| self.tabs.borrow()[index].kind == PageKind::Web)
+                    .unwrap_or(false)
+                {
+                    self.reload_active();
+                }
+            }
+            "waits_for_play" | "developer_extras" => self.tune_all(),
+            "new_tab_place" | "engine" | "custom_engine" => {
+                self.refresh_kind(PageKind::Welcome);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_site_data(&self, types: webkit2gtk::WebsiteDataTypes) {
+        for context in [&self.context, &self.private_context] {
+            if let Some(manager) = context.website_data_manager() {
+                manager.clear(types, glib::TimeSpan(0), None::<&gio::Cancellable>, |_result| {});
+            }
+        }
+    }
+
+    fn choose_downloads_folder(self: &Rc<Self>) {
+        let dialog = gtk::FileChooserDialog::with_buttons(
+            Some("Downloads Folder"),
+            Some(&self.window),
+            gtk::FileChooserAction::SelectFolder,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Choose", gtk::ResponseType::Accept),
+            ],
+        );
+        dialog.set_modal(true);
+        let current = self.prefs.borrow().downloads_path();
+        let _ = dialog.set_current_folder(&current);
+        let response = dialog.run();
+        let folder = dialog.filename();
+        dialog.close();
+        if response == gtk::ResponseType::Accept {
+            if let Some(folder) = folder {
+                self.prefs.borrow_mut().downloads_dir = folder.to_string_lossy().to_string();
+                self.prefs.borrow().save();
+                self.refresh_kind(PageKind::Settings);
+            }
+        }
+    }
+
+    fn prompt(&self, title: &str, message: &str, current: &str) -> Option<String> {
+        let dialog = gtk::Dialog::new();
+        dialog.set_title(title);
+        dialog.set_transient_for(Some(&self.window));
+        dialog.set_modal(true);
+        dialog.set_resizable(false);
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("OK", gtk::ResponseType::Ok);
+        dialog.set_default_response(gtk::ResponseType::Ok);
+        let area = dialog.content_area();
+        area.set_spacing(9);
+        area.set_margin_top(16);
+        area.set_margin_bottom(12);
+        area.set_margin_start(18);
+        area.set_margin_end(18);
+        let label = util::label(message, None);
+        label.set_xalign(0.0);
+        let entry = gtk::Entry::new();
+        entry.set_text(current);
+        entry.set_activates_default(true);
+        entry.set_width_chars(36);
+        area.pack_start(&label, false, false, 0);
+        area.pack_start(&entry, false, false, 0);
+        dialog.show_all();
+        entry.grab_focus();
+        entry.select_region(0, -1);
+        let response = dialog.run();
+        let text = entry.text().to_string();
+        dialog.close();
+        if response == gtk::ResponseType::Ok {
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    fn confirm(&self, title: &str, message: &str) -> bool {
+        let dialog = gtk::Dialog::new();
+        dialog.set_title(title);
+        dialog.set_transient_for(Some(&self.window));
+        dialog.set_modal(true);
+        dialog.set_resizable(false);
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("OK", gtk::ResponseType::Ok);
+        dialog.set_default_response(gtk::ResponseType::Ok);
+        let area = dialog.content_area();
+        area.set_margin_top(18);
+        area.set_margin_bottom(14);
+        area.set_margin_start(20);
+        area.set_margin_end(20);
+        let label = gtk::Label::new(Some(message));
+        label.set_line_wrap(true);
+        label.set_max_width_chars(44);
+        label.set_xalign(0.0);
+        area.add(&label);
+        dialog.show_all();
+        let response = dialog.run();
+        dialog.close();
+        response == gtk::ResponseType::Ok
+    }
+}
+
+// ---------------------------------------------------------------- passwords
+
+fn fill_script(user: &str, password: &str) -> String {
+    let user = serde_json::to_string(user).unwrap_or_else(|_| "\"\"".into());
+    let password = serde_json::to_string(password).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(function(){{
+try {{
+  const user = {user};
+  const password = {password};
+  const fields = document.querySelectorAll('input[type="password"]');
+  if (!fields.length) return;
+  const pass = fields[0];
+  const scope = pass.form || document;
+  const set = function (element, value) {{
+    if (!element) return;
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value');
+    if (descriptor && descriptor.set) {{ descriptor.set.call(element, value); }}
+    else {{ element.value = value; }}
+    element.dispatchEvent(new Event('input', {{bubbles:true}}));
+    element.dispatchEvent(new Event('change', {{bubbles:true}}));
+  }};
+  let account = null;
+  if (pass.form) {{
+    for (const input of scope.querySelectorAll('input')) {{
+      if (input === pass) continue;
+      const type = (input.type || 'text').toLowerCase();
+      if (type === 'password' || type === 'hidden' || type === 'submit') continue;
+      const hint = (input.getAttribute('autocomplete') || '').toLowerCase();
+      if (hint.indexOf('username') >= 0 || hint.indexOf('email') >= 0) {{ account = input; break; }}
+      if (!account && (type === 'text' || type === 'email' || type === 'tel')) account = input;
+    }}
+  }}
+  if (!account) {{
+    account = scope.querySelector('input[type="email"], input[type="text"]');
+  }}
+  if (account && user) set(account, user);
+  set(pass, password);
+  pass.focus();
+}} catch (error) {{}}
+}})();"#,
+        user = user,
+        password = password
+    )
+}
+
+impl Browser {
+    fn capture_login(self: &Rc<Self>, host: &str, user: &str, password: &str) {
+        if host.is_empty() || password.is_empty() {
+            return;
+        }
+        if !self.prefs.borrow().saves_passwords {
+            return;
+        }
+        if self
+            .vault
+            .borrow()
+            .for_host(host)
+            .iter()
+            .any(|login| login.user == user && login.password == password)
+        {
+            return;
+        }
+        *self.pending_login.borrow_mut() = Some((
+            host.to_string(),
+            user.to_string(),
+            password.to_string(),
+        ));
+        self.show_toast(
+            &format!("Save the password for {}?", host),
+            Some("Save"),
+            Some(ToastCommand::SaveLogin),
+        );
+    }
+
+    fn save_pending_login(self: &Rc<Self>) {
+        let pending = self.pending_login.borrow_mut().take();
+        let Some((host, user, password)) = pending else {
+            return;
+        };
+        self.vault.borrow_mut().keep(&host, &user, &password, false);
+        self.vault.borrow_mut().save();
+        self.refresh_kind(PageKind::Passwords);
+        self.refresh_kind(PageKind::Settings);
+        self.toast("Password saved");
+    }
+
+    fn apply_pending_fill(self: &Rc<Self>, index: usize) {
+        let pending = self.pending_fill.borrow().clone();
+        let Some((host, user, password)) = pending else {
+            return;
+        };
+        if index >= self.tabs.borrow().len() {
+            return;
+        }
+        let (url, view) = {
+            let tabs = self.tabs.borrow();
+            (tabs[index].url.clone(), tabs[index].view.clone())
+        };
+        if store::bare_host(&url) != host {
+            return;
+        }
+        if !self.prefs.borrow().fills_passwords {
+            *self.pending_fill.borrow_mut() = None;
+            return;
+        }
+        self.run_js(&view, &fill_script(&user, &password));
+        self.vault.borrow_mut().touch(&host, &user);
+        self.vault.borrow_mut().save();
+        *self.pending_fill.borrow_mut() = None;
+        self.toast("Filled in");
+    }
+
+    fn fill_login(self: &Rc<Self>, host: &str, user: &str) {
+        let login = self
+            .vault
+            .borrow()
+            .for_host(host)
+            .into_iter()
+            .find(|login| login.user == user);
+        let Some(login) = login else {
+            self.toast("That password is gone");
+            return;
+        };
+        let password = login.password.clone();
+        let host = login.host.clone();
+        let user = login.user.clone();
+        let matches = self
+            .active_index()
+            .map(|index| {
+                let tabs = self.tabs.borrow();
+                tabs[index].kind == PageKind::Web && store::bare_host(&tabs[index].url) == host
+            })
+            .unwrap_or(false);
+        if matches {
+            if let Some(index) = self.active_index() {
+                let view = self.tabs.borrow()[index].view.clone();
+                self.run_js(&view, &fill_script(&user, &password));
+            }
+            self.vault.borrow_mut().touch(&host, &user);
+            self.vault.borrow_mut().save();
+            self.toast("Filled in");
+            return;
+        }
+        *self.pending_fill.borrow_mut() = Some((host.clone(), user.clone(), password));
+        let url = format!("https://{}", host);
+        self.add_tab(Some(&url), false, true, None, None, None, false);
+    }
+
+    fn reveal_password(self: &Rc<Self>, host: &str, user: &str) {
+        let login = self
+            .vault
+            .borrow()
+            .for_host(host)
+            .into_iter()
+            .find(|login| login.user == user);
+        let Some(login) = login else {
+            self.toast("That password is gone");
+            return;
+        };
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let script = format!(
+            "window.__showPassword && window.__showPassword({}, {}, {});",
+            serde_json::to_string(&login.host).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(&login.user).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(&login.password).unwrap_or_else(|_| "\"\"".into())
+        );
+        self.run_js(&view, &script);
+        self.vault.borrow_mut().touch(&login.host, &login.user);
+        self.vault.borrow_mut().save();
+    }
+}
+
+// ---------------------------------------------------------------- downloads
+
+impl Browser {
+    fn download_views(&self) -> Vec<DownloadView> {
+        self.downloads
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let mut view = record.view.clone();
+                view.index = index;
+                view.received = record.download.received_data_length();
+                if let Some(destination) = record.download.destination() {
+                    view.path = destination.to_string();
+                }
+                view
+            })
+            .collect()
+    }
+
+    fn begin_download(self: &Rc<Self>, download: Download) {
+        let response = download.response();
+        let suggested = response
+            .as_ref()
+            .and_then(|response| response.suggested_filename())
+            .map(|name| name.to_string())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "download".to_string());
+        let url = response
+            .as_ref()
+            .and_then(|response| response.uri())
+            .map(|uri| uri.to_string())
+            .unwrap_or_default();
+        let total = response
+            .as_ref()
+            .map(|response| response.content_length())
+            .unwrap_or(0);
+        let folder = self.prefs.borrow().downloads_path();
+        store::ensure_dir(&folder);
+
+        let destination = if self.prefs.borrow().ask_downloads {
+            let dialog = gtk::FileChooserDialog::with_buttons(
+                Some("Save File"),
+                Some(&self.window),
+                gtk::FileChooserAction::Save,
+                &[
+                    ("Cancel", gtk::ResponseType::Cancel),
+                    ("Save", gtk::ResponseType::Accept),
+                ],
+            );
+            dialog.set_modal(true);
+            dialog.set_do_overwrite_confirmation(true);
+            dialog.set_current_name(&suggested);
+            let _ = dialog.set_current_folder(&folder);
+            let response = dialog.run();
+            let path = dialog.filename();
+            dialog.close();
+            if response == gtk::ResponseType::Accept {
+                path
+            } else {
+                download.cancel();
+                return;
+            }
+        } else {
+            Some(unique_path(&folder, &suggested))
+        };
+        let Some(destination) = destination else {
+            download.cancel();
+            return;
+        };
+        download.set_destination(&destination.to_string_lossy());
+        let host = store::bare_host(&url);
+        let view = DownloadView {
+            index: self.downloads.borrow().len(),
+            name: destination
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| suggested.clone()),
+            path: destination.to_string_lossy().to_string(),
+            host: if host.is_empty() {
+                "Search".into()
+            } else {
+                host
+            },
+            url: url.clone(),
+            received: 0,
+            total,
+            state: "Downloading".into(),
+        };
+        self.downloads.borrow_mut().push(DownloadRecord {
+            view,
+            download: download.clone(),
+        });
+
+        let weak = self.this.clone();
+        download.connect_received_data(move |_download, _length| {
+            if let Some(browser) = weak.upgrade() {
+                browser.refresh_downloads_page();
+            }
+        });
+        let weak = self.this.clone();
+        let handle = download.clone();
+        download.connect_finished(move |_download| {
+            if let Some(browser) = weak.upgrade() {
+                let size = std::fs::metadata(
+                    browser
+                        .downloads
+                        .borrow()
+                        .iter()
+                        .find(|record| record.download == handle)
+                        .map(|record| record.view.path.clone())
+                        .unwrap_or_default(),
+                )
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+                if let Some(record) = browser
+                    .downloads
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|record| record.download == handle)
+                {
+                    record.view.state = "Finished".into();
+                    if size > 0 {
+                        record.view.received = size;
+                    }
+                }
+                browser.refresh_downloads_page();
+                let name = browser
+                    .downloads
+                    .borrow()
+                    .iter()
+                    .find(|record| record.download == handle)
+                    .map(|record| record.view.name.clone())
+                    .unwrap_or_else(|| "File".into());
+                browser.toast(&format!("Downloaded {}", name));
+                if browser.prefs.borrow().always_downloads {
+                    browser.go_internal("downloads");
+                }
+            }
+        });
+        let weak = self.this.clone();
+        let handle = download.clone();
+        download.connect_failed(move |_download, _error| {
+            if let Some(browser) = weak.upgrade() {
+                if let Some(record) = browser
+                    .downloads
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|record| record.download == handle)
+                {
+                    record.view.state = "Failed".into();
+                }
+                browser.refresh_downloads_page();
+                browser.toast("That download didn't finish");
+            }
+        });
+
+        self.refresh_downloads_page();
+        if self.prefs.borrow().always_downloads {
+            self.go_internal("downloads");
+        }
+    }
+
+    fn refresh_downloads_page(self: &Rc<Self>) {
+        let views = self.download_views();
+        if self.downloads.borrow().is_empty() {
+            return;
+        }
+        let rows = pages::download_rows(&views);
+        let literal = serde_json::to_string(&rows).unwrap_or_else(|_| "\"\"".into());
+        let script = format!(
+            "if (window.__updateDownloads) window.__updateDownloads({});",
+            literal
+        );
+        let views: Vec<WebView> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| tab.kind == PageKind::Downloads)
+            .map(|tab| tab.view.clone())
+            .collect();
+        for view in views {
+            self.run_js(&view, &script);
+        }
+    }
+
+    fn open_download(self: &Rc<Self>, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let file = gio::File::for_path(path);
+        if let Err(error) = gtk::show_uri_on_window(
+            Some(&self.window),
+            file.uri().as_str(),
+            gtk::current_event_time(),
+        ) {
+            self.toast(&format!("Couldn't open it: {}", error.message()));
+        }
+    }
+
+    fn reveal_download(self: &Rc<Self>, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let folder = std::path::Path::new(path)
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(path));
+        let file = gio::File::for_path(folder);
+        let _ = gtk::show_uri_on_window(
+            Some(&self.window),
+            file.uri().as_str(),
+            gtk::current_event_time(),
+        );
+    }
+
+    fn cancel_download(self: &Rc<Self>, index: usize) {
+        let download = self
+            .downloads
+            .borrow()
+            .get(index)
+            .map(|record| record.download.clone());
+        if let Some(download) = download {
+            download.cancel();
+            if let Some(record) = self.downloads.borrow_mut().get_mut(index) {
+                record.view.state = "Cancelled".into();
+            }
+            self.refresh_downloads_page();
+            self.toast("Download cancelled");
+        }
+    }
+
+    pub fn ublock_ready(self: &Rc<Self>, filter: *mut webkit2gtk::ffi::WebKitUserContentFilter) {
+        if filter.is_null() {
+            self.ublock_failed();
+            return;
+        }
+        *self.filter.borrow_mut() = Some(filter);
+        self.filter_ready.set(true);
+        self.tune_all();
+        self.load_waiting_active();
+        self.refresh_header();
+    }
+
+    /// The filter compiled or loaded badly. Pages must still open, so stop
+    /// waiting for it and go on without content blocking.
+    pub fn ublock_failed(self: &Rc<Self>) {
+        eprintln!("Search: uBlock filters unavailable, continuing without them");
+        self.filter_ready.set(true);
+        self.tune_all();
+        self.load_waiting_active();
+        self.refresh_header();
+    }
+
+    fn may_load(&self, kind: PageKind) -> bool {
+        kind != PageKind::Web || !self.prefs.borrow().adblock || self.filter_ready.get()
+    }
+
+    fn load_waiting_active(self: &Rc<Self>) {
+        let Some(index) = self.active_index() else {
+            return;
+        };
+        let (suspended, kind, url) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (tab.suspended, tab.kind, tab.url.clone())
+        };
+        if suspended && self.may_load(kind) {
+            self.load_page(index, &url);
+        }
+    }
+
+    fn load_page(self: &Rc<Self>, index: usize, url: &str) {
+        if index >= self.tabs.borrow().len() || url.is_empty() || url == "about:blank" {
+            return;
+        }
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let tab = &mut tabs[index];
+            tab.suspended = false;
+            tab.last_used = Instant::now();
+            tab.retried.set(false);
+            tab.retrying.set(false);
+        }
+        self.tune_for_id(index, url);
+        let view = self.tabs.borrow()[index].view.clone();
+        view.load_uri(url);
+    }
+
+    /// Release the web process of background tabs that have not been used in
+    /// a while. WebKitGTK gives every view its own process, so this is the
+    /// difference between a few hundred megabytes and several gigabytes when
+    /// many tabs are open. The page reloads when it is picked again.
+    fn sleep_inactive_tabs(self: &Rc<Self>) {
+        if !self.prefs.borrow().sleep_tabs {
+            return;
+        }
+        let wait = std::env::var("SEARCH_SLEEP_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(10 * 60));
+        let active = self.active.get();
+        let split = self.split_second.get();
+        let targets: Vec<usize> = self
+            .tabs
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(index, tab)| {
+                *index != active
+                    && split != Some(tab.id)
+                    && !tab.suspended
+                    && tab.pin.is_none()
+                    && tab.kind == PageKind::Web
+                    && !tab.url.is_empty()
+                    && tab.last_used.elapsed() >= wait
+                    && !tab.view.is_playing_audio()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in targets {
+            let (url, view) = {
+                let mut tabs = self.tabs.borrow_mut();
+                let tab = &mut tabs[index];
+                tab.suspended = true;
+                tab.filtered = false;
+                (tab.url.clone(), tab.view.clone())
+            };
+            view.terminate_web_process();
+            eprintln!("Search: slept {}", store::pretty_url(&url));
+        }
+    }
+
+    fn tune_for_id(self: &Rc<Self>, index: usize, url: &str) {
+        if index >= self.tabs.borrow().len() {
+            return;
+        }
+        let (manager, view, filtered) = {
+            let tabs = self.tabs.borrow();
+            let tab = &tabs[index];
+            (tab.manager.clone(), tab.view.clone(), tab.filtered)
+        };
+        let host = store::bare_host(url);
+        let (blocking, zoom, waits, developer) = {
+            let prefs = self.prefs.borrow();
+            (
+                prefs.adblock
+                    && !host.is_empty()
+                    && !prefs.shield_paused_on(&host)
+                    && !url.starts_with("search:"),
+                prefs.page_zoom,
+                prefs.waits_for_play,
+                prefs.developer_extras,
+            )
+        };
+        let want_filter = blocking && self.filter.borrow().is_some();
+        if want_filter != filtered {
+            let manager_ptr = manager.to_glib_none().0;
+            let identifier = CString::new(crate::ublock::FILTER_ID).unwrap();
+            unsafe {
+                webkit2gtk::ffi::webkit_user_content_manager_remove_filter_by_id(
+                    manager_ptr,
+                    identifier.as_ptr(),
+                );
+                if want_filter {
+                    if let Some(filter) = *self.filter.borrow() {
+                        webkit2gtk::ffi::webkit_user_content_manager_add_filter(
+                            manager_ptr,
+                            filter,
+                        );
+                    }
+                }
+            }
+            self.tabs.borrow_mut()[index].filtered = want_filter;
+        }
+        view.set_zoom_level(zoom);
+        view.set_background_color(&self.page_background());
+        if let Some(settings) = WebViewExt::settings(&view) {
+            settings.set_media_playback_requires_user_gesture(waits);
+            settings.set_enable_developer_extras(developer);
+        }
+    }
+
+    fn tune_all(self: &Rc<Self>) {
+        let targets: Vec<(usize, String)> = self
+            .tabs
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (index, tab.url.clone()))
+            .collect();
+        for (index, url) in targets {
+            self.tune_for_id(index, &url);
+        }
+    }
+}

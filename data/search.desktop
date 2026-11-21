@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Search
+Comment=Fast web browser
+Exec=search %U
+Icon=/home/pedro/Search-Linux/data/search.svg
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
